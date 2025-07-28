@@ -122,16 +122,7 @@ class FactorSelector:
             if selector_func is None:
                 raise ValueError(f"Unknown factor selection method: {self.method}")
             vec = selector_func(metrics_df, factors_win, returns_win, factor_ret_win, today, window_dates, **self.method_kwargs)
-            
-            # For MVO, skip days with zero weights until we find the first non-zero weights
-            if self.method == 'mvo':
-                if not found_nonzero_mvo and vec.sum() > 0:
-                    found_nonzero_mvo = True
-                    logger.info(f"First non-zero MVO weights found on {today}")
-                
-                if not found_nonzero_mvo:
-                    logger.info(f"Skipping zero weights for MVO on {today}")
-                    continue
+
             
             vec.name = today
             all_vecs.append(vec)

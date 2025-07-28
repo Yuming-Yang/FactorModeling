@@ -9,7 +9,7 @@ from scipy import stats
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import matplotlib.cm as cm
-from tqdm import tqdm
+# from tqdm import tqdm  # Commented out to avoid progress bar issues in Jupyter
 import matplotlib.dates as mdates
 from portfolio_analyzer import *
 from portfolio_simulation import *
@@ -276,7 +276,7 @@ def weighted_composite_factor(
         return pd.Series((r - 1) / (len(r) - 1), index=x.index)
 
     pieces = []
-    for date, weights in tqdm(selection_df.iterrows()):
+    for date, weights in selection_df.iterrows():
         # Only keep factors with nonzero weight
         today_factors = weights[weights > 0].index.tolist()
         syms = factors_df.loc[date].index if date in factors_df.index.get_level_values('date') else []
