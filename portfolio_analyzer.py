@@ -192,11 +192,12 @@ class PortfolioAnalyzer:
         if has_turnover:
             ax_turnover = fig.add_subplot(gs[current_row, :], sharex=ax_main)
             avg_turnover = self.df['turnover'].mean()
-            mask = self.df['turnover'] > 1.5
-            if mask.any():
-                first_day = mask.idxmax()   # label of the first True
-                self.df.loc[first_day, ['turnover','long_turnover','short_turnover']] = 0
+
+            # Mask turnover > 1.5 and set to 0 for plotting
+            self.df.loc[self.df['turnover'] > 1.5, ['turnover', 'long_turnover', 'short_turnover']] = 0
+
             ax_turnover.plot(self.df['date'], self.df['turnover'], color='purple', linewidth=1.2, label='Total Turnover')
+            
             
             if has_leg_turnover:
                 if 'long_turnover' in self.df.columns:
