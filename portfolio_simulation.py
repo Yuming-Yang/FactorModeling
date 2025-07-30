@@ -3,7 +3,6 @@ import pandas as pd
 from portfolio_analyzer import PortfolioAnalyzer
 from dataclasses import dataclass
 from tqdm import tqdm
-import scipy.linalg
 
 @dataclass
 class SimulationSettings:
@@ -24,17 +23,17 @@ class SimulationSettings:
     output_summary: bool = False
     output_returns: bool = False
     plot: bool = True
+    original_factors: pd.DataFrame = None
     
-    # MVO-specific parameters
+    # MVO-specific parameters (placeholder - not used)
     mvo_window: int = 60           # look-back window for covariance estimation
-    risk_aversion: float = 1.0      # risk aversion parameter (higher = more conservative) - FIXED DEFAULT
-    turnover_penalty: float = 0.1  # penalty for portfolio turnover - FIXED DEFAULT
-    covariance_shrinkage: float = 0.1  # covariance shrinkage intensity [0-1]
+    risk_aversion: float = 1.0      # risk aversion parameter (higher = more conservative)
+    turnover_penalty: float = 5.0   # penalty for portfolio turnover (higher = less turnover)
     
-    # Barra-style parameters
+    # Barra-style parameters (placeholder - not used)
     factor_names: list = None       # list of factor names to use for Barra optimization
-    barra_window: int = 252         # look-back window for factor return estimation - FIXED DEFAULT
-    barra_risk_aversion: float = 1.0  # risk aversion for factor-level optimization - FIXED DEFAULT
+    barra_window: int = 252         # look-back window for factor return estimation
+    barra_risk_aversion: float = 1.0  # risk aversion for factor-level optimization
 
 class Simulation:
     """
@@ -66,6 +65,17 @@ class Simulation:
         self.output_returns     = s.output_returns
         self.plot               = s.plot
         self.single_factor_returns = s.single_factor_returns
+        self.original_factors     = s.original_factors
+
+        # MVO-specific parameters (placeholder - not used)
+        self.mvo_window = getattr(s, "mvo_window", 60)
+        self.risk_aversion = getattr(s, "risk_aversion", 1.0)
+        self.turnover_penalty = getattr(s, "turnover_penalty", 5.0)
+        
+        # Barra-specific parameters (placeholder - not used)
+        self.factor_names = getattr(s, "factor_names", None)
+        self.barra_window = getattr(s, "barra_window", 252)
+        self.barra_risk_aversion = getattr(s, "barra_risk_aversion", 1.0)
 
     def run(self):
         self.factors_df[self.name] = self.custom_feature
@@ -106,450 +116,36 @@ class Simulation:
         
     def _optimal_weight_daily_trade_list(self):
         """
-        Mean-variance optimization for stock portfolio weights based on stock returns.
-        
-        For each date:
-        1. Estimate expected stock returns and covariance using rolling window of stock returns
-        2. Solve mean-variance optimization with turnover penalty for stock portfolio
-        3. Normalize long and short legs separately
-        4. Apply constraints (max weight, etc.)
-        
-        This method uses stock returns only - factors are used elsewhere for factor weighting.
-        
-        Returns:
-            weights: pd.Series with MultiIndex (date, symbol) - one-day lagged stock portfolio weights
-            counts_df: pd.DataFrame with date index and columns ['long_count', 'short_count']
+        Placeholder for MVO optimization - not implemented.
+        Returns empty results to maintain compatibility.
         """
-        # Get MVO parameters from settings with defaults
-        window = getattr(self.settings, "mvo_window", 60)  # look-back window
-        risk_aversion = getattr(self.settings, "risk_aversion", 1.0)  # risk aversion parameter - FIXED DEFAULT
-        turnover_penalty = getattr(self.settings, "turnover_penalty", 0.1)  # turnover penalty strength
-        shrinkage = getattr(self.settings, "covariance_shrinkage", 0.1)  # covariance shrinkage
+        print("MVO optimization not implemented - using placeholder")
         
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
+        # Return empty results that match expected format
+        empty_weights = pd.Series(dtype=float)
+        empty_counts = pd.DataFrame(columns=["long_count", "short_count"])
         
-        # Get returns data in wide format for efficient computation
-        returns_wide = self.returns.unstack().sort_index()
-        
-        # Create date to position mapping for efficient slicing
-        date_to_pos = {d: pos for pos, d in enumerate(returns_wide.index)}
-        
-        for date, group in self.custom_feature.groupby(level="date"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Get historical returns for estimation
-            pos = date_to_pos.get(date)
-            if pos is None or pos < window:
-                # Not enough history, carry forward
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Get historical data for current investable symbols
-            start_pos = max(0, pos - window)
-            hist_returns = returns_wide.iloc[start_pos:pos]
-            
-            # Filter to current investable symbols (same as x)
-            hist_returns = hist_returns[x.index].dropna(axis=1, how="all")
-            
-            if len(hist_returns.columns) < self.min_universe:
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Estimate expected returns and covariance from stock returns only
-            mu = hist_returns.mean()  # Expected returns from historical stock returns
-            cov = hist_returns.cov()  # Covariance matrix from historical stock returns
-            
-            # Align with current investable symbols
-            common_symbols = x.index.intersection(mu.index)
-            if len(common_symbols) < self.min_universe:
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Combine historical returns with factor values for expected returns
-            # This integrates the factor information into the MVO optimization
-            factor_values = x.reindex(common_symbols).fillna(0)
-            historical_returns = mu.reindex(common_symbols).fillna(0)
-            
-            # Create expected returns that combine historical performance and factor signals
-            # Scale factor values to be comparable with historical returns
-            factor_scale = historical_returns.std() if historical_returns.std() > 0 else 0.01
-            expected_returns = historical_returns + 0.1 * factor_values * factor_scale
-            
-            # Get covariance matrix for common symbols only
-            cov_common = cov.loc[common_symbols, common_symbols]
-            
-            # Apply covariance shrinkage for stability
-            if shrinkage > 0:
-                diag_cov = np.diag(np.diag(cov_common.values))
-                cov_shrink = (1.0 - shrinkage) * cov_common.values + shrinkage * diag_cov
-            else:
-                cov_shrink = cov_common.values
-            
-            # Validate optimization parameters
-            if risk_aversion <= 0:
-                print(f"Warning: Invalid risk_aversion {risk_aversion}, using default 1.0")
-                risk_aversion = 1.0
-                
-            if turnover_penalty < 0:
-                print(f"Warning: Invalid turnover_penalty {turnover_penalty}, using default 0.1")
-                turnover_penalty = 0.1
-            
-            # Solve mean-variance optimization for stock portfolio weights
-            try:
-                w_optimal = self._solve_mvo_optimization(
-                    expected_returns, 
-                    cov_shrink, 
-                    common_symbols,
-                    risk_aversion,
-                    turnover_penalty,
-                    prev_weights
-                )
-                
-                # Validate solution
-                if not np.isfinite(w_optimal).all():
-                    raise ValueError("Non-finite weights in optimization solution")
-                    
-            except Exception as e:
-                # Fallback to simple approach if optimization fails
-                print(f"Optimization failed for {date}: {e}")
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Apply weight constraints and normalize
-            w_optimal = self._process_weights(w_optimal)
-            
-            # Count positions
-            long_count = int((w_optimal > 0).sum())
-            short_count = int((w_optimal < 0).sum())
-            
-            # Store results
-            prev_weights = w_optimal
-            prev_counts = {"long_count": long_count, "short_count": short_count}
-            
-            # Add date level to weights
-            w_optimal.index = pd.MultiIndex.from_product(
-                [[date], w_optimal.index],
-                names=["date", "symbol"]
-            )
-            weights_list.append(w_optimal)
-            count_list.append({
-                "date": date,
-                "long_count": long_count,
-                "short_count": short_count
-            })
-        
-        # Combine all results
-        if not weights_list:
-            return pd.Series(dtype=float), pd.DataFrame(columns=["long_count", "short_count"])
-        
-        all_weights = pd.concat(weights_list).sort_index()
-        shifted_weights = all_weights.groupby("symbol").shift(1)  # One-day lag
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        
-        return shifted_weights, counts_df
-    
-    def _solve_mvo_optimization(self, expected_returns, covariance, symbols, 
-                               risk_aversion, turnover_penalty, prev_weights):
-        """
-        Solve mean-variance optimization for stock portfolio weights.
-        
-        Uses stock returns to estimate expected returns and covariance.
-        Objective function: maximize μ'w - (λ/2)w'Σw - (γ/2)||w - w_prev||²
-        
-        The first-order condition gives:
-        μ - λΣw - γ(w - w_prev) = 0
-        => (λΣ + γI)w = μ + γw_prev
-        => w = (λΣ + γI)⁻¹(μ + γw_prev)
-        
-        Args:
-            expected_returns: pd.Series of expected stock returns (from historical data)
-            covariance: np.array of stock return covariance matrix
-            symbols: list of stock symbols
-            risk_aversion: float, risk aversion parameter (λ)
-            turnover_penalty: float, penalty for portfolio turnover (γ)
-            prev_weights: pd.Series of previous stock portfolio weights
-            
-        Returns:
-            pd.Series of optimal stock portfolio weights
-        """
-        n_assets = len(symbols)
-        
-        # Ensure numerical stability by adding small regularization
-        reg_factor = 1e-8
-        cov_reg = covariance + reg_factor * np.eye(n_assets)
-        
-        # If no previous weights, solve simple MVO
-        if prev_weights.empty:
-            # Simple mean-variance optimization: w ∝ Σ⁻¹ μ
-            # The solution is: w = (1/λ) * Σ⁻¹ μ
-            try:
-                # Use scipy.linalg.solve for efficiency and numerical stability
-                w_raw = scipy.linalg.solve(cov_reg, expected_returns.values, assume_a='sym')
-            except Exception as e:
-                # Fallback to pseudo-inverse if matrix is singular
-                print(f"Warning: Using pseudo-inverse due to singular matrix: {e}")
-                w_raw = np.linalg.pinv(cov_reg).dot(expected_returns.values)
-            
-            # Scale by risk aversion (higher risk aversion = smaller weights)
-            # The MVO solution is w = (1/λ) * Σ⁻¹ μ, so we divide by risk_aversion
-            w_raw = w_raw / risk_aversion
-            
-            w_optimal = pd.Series(w_raw, index=symbols)
-            
-        else:
-            # With turnover penalty
-            # Align previous weights with current symbols
-            prev_aligned = prev_weights.reindex(symbols).fillna(0.0)
-            
-            # Solve: w = argmax μ'w - (λ/2)w'Σw - (γ/2)||w - w_prev||²
-            # First-order condition: μ - λΣw - γ(w - w_prev) = 0
-            # => (λΣ + γI)w = μ + γw_prev
-            # => w = (λΣ + γI)⁻¹(μ + γw_prev)
-            
-            gamma = turnover_penalty
-            identity = np.eye(n_assets)
-            
-            try:
-                # Solve (λΣ + γI)w = μ + γw_prev
-                rhs = expected_returns.values + gamma * prev_aligned.values
-                lhs = risk_aversion * cov_reg + gamma * identity
-                w_raw = scipy.linalg.solve(lhs, rhs, assume_a='sym')
-            except Exception as e:
-                # Fallback to pseudo-inverse
-                print(f"Warning: Using pseudo-inverse for turnover penalty: {e}")
-                lhs = risk_aversion * cov_reg + gamma * identity
-                w_raw = np.linalg.pinv(lhs).dot(rhs)
-            
-            w_optimal = pd.Series(w_raw, index=symbols)
-        
-        return w_optimal
-
+        return empty_weights, empty_counts
 
     def _barra_style_daily_trade_list(self):
         """
-        Barra-style risk model approach using factor exposures and factor returns.
-        
-        For each date:
-        1. Get factor exposures for each stock (from factors_df)
-        2. Estimate factor returns and factor covariance using rolling window
-        3. Solve mean-variance optimization on factor level
-        4. Convert factor weights to stock weights using factor exposures
-        5. Integrate alpha signal (custom_feature) into final weights
-        
-        Returns:
-            weights: pd.Series with MultiIndex (date, symbol) - one-day lagged stock portfolio weights
-            counts_df: pd.DataFrame with date index and columns ['long_count', 'short_count']
+        Placeholder for Barra-style optimization - not implemented.
+        Returns empty results to maintain compatibility.
         """
-        # Get Barra parameters from settings
-        factor_names = getattr(self.settings, "factor_names", None)
-        if factor_names is None:
-            raise ValueError("factor_names must be provided for Barra-style optimization")
+        print("Barra-style optimization not implemented - using placeholder")
         
-        barra_window = getattr(self.settings, "barra_window", 252)
-        barra_risk_aversion = getattr(self.settings, "barra_risk_aversion", 1.0)
+        # Return empty results that match expected format
+        empty_weights = pd.Series(dtype=float)
+        empty_counts = pd.DataFrame(columns=["long_count", "short_count"])
         
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
-        
-        # Get factor returns data
-        factor_returns = self.single_factor_returns[factor_names].sort_index()
-        
-        # Create date to position mapping for efficient slicing
-        date_to_pos = {d: pos for pos, d in enumerate(factor_returns.index)}
-        
-        for date, group in self.custom_feature.groupby(level="date"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Get historical factor returns for estimation
-            pos = date_to_pos.get(date)
-            if pos is None or pos < barra_window:
-                # Not enough history, carry forward
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Get historical factor returns
-            start_pos = max(0, pos - barra_window)
-            hist_factor_returns = factor_returns.iloc[start_pos:pos]
-            
-            # Estimate factor returns and factor covariance
-            factor_mu = hist_factor_returns.mean()  # Expected factor returns
-            factor_cov = hist_factor_returns.cov()  # Factor covariance matrix
-            
-            # Get factor exposures for current stocks - FIXED LOGIC
-            exposures_dict = {}
-            for stock in x.index:
-                stock_exposures = {}
-                for factor in factor_names:
-                    # Get factor value for this stock on this date
-                    if factor in self.factors_df.columns:
-                        factor_value = self.factors_df.loc[(date, stock), factor] if (date, stock) in self.factors_df.index else 0.0
-                    else:
-                        factor_value = 0.0
-                    stock_exposures[factor] = factor_value
-                exposures_dict[stock] = stock_exposures
-            
-            if not exposures_dict or len(exposures_dict) < self.min_universe:
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Create exposures DataFrame properly
-            exposures_df = pd.DataFrame.from_dict(exposures_dict, orient='index')
-            
-            # Solve factor-level mean-variance optimization
-            try:
-                # Ensure numerical stability
-                reg_factor = 1e-8
-                cov_reg = factor_cov.values + reg_factor * np.eye(len(factor_names))
-                
-                # Solve w = (1/λ) * Σ⁻¹ μ
-                try:
-                    w_raw = scipy.linalg.solve(cov_reg, factor_mu.values, assume_a='sym')
-                except Exception as e:
-                    # Fallback to pseudo-inverse if matrix is singular
-                    print(f"Warning: Using pseudo-inverse for factor optimization: {e}")
-                    w_raw = np.linalg.pinv(cov_reg).dot(factor_mu.values)
-                
-                # Scale by risk aversion
-                w_raw = w_raw / barra_risk_aversion
-                factor_weights = pd.Series(w_raw, index=factor_names)
-                
-                # Convert factor weights to stock weights using factor exposures
-                stock_weights = exposures_df.dot(factor_weights)
-                
-                # INTEGRATE ALPHA SIGNAL: Combine factor-based weights with alpha signal
-                alpha_signal = x.reindex(stock_weights.index).fillna(0)
-                
-                # Combine factor weights with alpha signal
-                # Scale alpha signal to be comparable with factor weights
-                alpha_scale = stock_weights.std() if stock_weights.std() > 0 else 0.01
-                combined_weights = stock_weights + 0.1 * alpha_signal * alpha_scale
-                
-                # Validate solution
-                if not np.isfinite(combined_weights).all():
-                    raise ValueError("Non-finite weights in Barra optimization solution")
-                    
-            except Exception as e:
-                # Fallback to simple approach if optimization fails
-                print(f"Barra optimization failed for {date}: {e}")
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-            
-            # Process weights (normalize and apply constraints)
-            combined_weights = self._process_weights(combined_weights)
-            
-            # Count positions
-            long_count = int((combined_weights > 0).sum())
-            short_count = int((combined_weights < 0).sum())
-            
-            # Store results
-            prev_weights = combined_weights
-            prev_counts = {"long_count": long_count, "short_count": short_count}
-            
-            # Add date level to weights
-            combined_weights.index = pd.MultiIndex.from_product(
-                [[date], combined_weights.index],
-                names=["date", "symbol"]
-            )
-            weights_list.append(combined_weights)
-            count_list.append({
-                "date": date,
-                "long_count": long_count,
-                "short_count": short_count
-            })
-        
-        # Combine all results
-        if not weights_list:
-            return pd.Series(dtype=float), pd.DataFrame(columns=["long_count", "short_count"])
-        
-        all_weights = pd.concat(weights_list).sort_index()
-        shifted_weights = all_weights.groupby("symbol").shift(1)  # One-day lag
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        
-        return shifted_weights, counts_df
-
+        return empty_weights, empty_counts
 
     def _equal_weight_daily_trade_list(self):
         weights_list, count_list = [], []
         prev_weights = pd.Series(dtype=float)
         prev_long = prev_short = np.nan
 
-        for date, group in self.custom_feature.groupby(level="date"):
+        for date, group in tqdm(self.custom_feature.groupby(level="date"), desc="Equal Weight Simulation"):
             x = group.droplevel('date').dropna()
             if len(x) < self.min_universe:
                 # carry previous if too small
@@ -560,9 +156,9 @@ class Simulation:
                         names=["date", "symbol"]
                     )
                     weights_list.append(carried)
-                    count_list.append({"date": date,
-                                       "long_count": prev_long,
-                                       "short_count": prev_short})
+                    # Use consistent count storage
+                    prev_counts = {"long_count": prev_long, "short_count": prev_short}
+                    count_list.append({"date": date, **prev_counts})
                 continue
 
             n = len(x)
@@ -607,7 +203,7 @@ class Simulation:
         prev_weights = pd.Series(dtype=float)
         prev_counts = {"long_count": np.nan, "short_count": np.nan}
 
-        for date, group in self.custom_feature.groupby(level='date'):
+        for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="Flexible Weight Simulation"):
             x = group.droplevel('date').dropna()
             if len(x) < self.min_universe:
                 if not prev_weights.empty:
@@ -647,7 +243,7 @@ class Simulation:
                                "long_count": long_count,
                                "short_count": short_count})
 
-        all_w = pd.concat(weights_list)
+        all_w = pd.concat(weights_list).sort_index()
         shifted = all_w.groupby("symbol").shift(1)
         counts_df = pd.DataFrame(count_list).set_index("date")
         return shifted, counts_df
