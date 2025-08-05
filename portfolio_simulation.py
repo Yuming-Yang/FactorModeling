@@ -27,19 +27,21 @@ class SimulationSettings:
     plot: bool = True
     original_factors: pd.DataFrame = None
     
-    # MVO-specific parameters
-    mvo_window: int = 60           # look-back window for covariance estimation
-    risk_aversion: float = 1.0      # risk aversion parameter (higher = more conservative)
-    turnover_penalty: float = 5.0   # penalty for portfolio turnover (higher = less turnover)
-    factor_weight: float = 0.5     # weight for composite factor (0.0 = pure MVO, 1.0 = pure factor)
+    # shared optimization parameters (used by MVO, PCA-MVO, Barra)
+    historical_window: int = 60    # look-back window for historical returns estimation
+    turnover_penalty: float = 5.0  # penalty for portfolio turnover (higher = less turnover)
+    factor_weight: float = 0.5     # weight for composite factor vs optimization (0.0 = pure optimization, 1.0 = pure factor)
     
-    # PCA-MVO parameters
+    # MVO/PCA-MVO parameters
+    risk_aversion: float = 1.0      # risk aversion parameter for MVO and PCA-MVO (higher = more conservative)
+    
+    # PCA-MVO specific parameters
     pca_n_components: int = 10      # number of PCA components for PCA-MVO
     
     # Barra-style parameters
+    barra_risk_aversion: float = 1.0  # risk aversion for Barra optimization (higher = more conservative)
+    barra_window: int = 60         # look-back window for factor return estimation in Barra model
     factor_names: list = None       # list of factor names to use for Barra optimization (None = use all available)
-    barra_window: int = 252         # look-back window for factor return estimation
-    barra_risk_aversion: float = 1.0  # risk aversion for Barra optimization
 
 class Simulation:
     """
@@ -73,11 +75,13 @@ class Simulation:
         self.single_factor_returns = s.single_factor_returns
         self.original_factors     = s.original_factors
 
-        # MVO-specific parameters
-        self.mvo_window = getattr(s, "mvo_window", 60)
-        self.risk_aversion = getattr(s, "risk_aversion", 1.0)
+        # Shared optimization parameters
+        self.historical_window = getattr(s, "historical_window", getattr(s, "mvo_window", 60))  # backward compatibility
         self.turnover_penalty = getattr(s, "turnover_penalty", 5.0)
         self.factor_weight = getattr(s, "factor_weight", 0.5)
+        
+        # MVO/PCA-MVO parameters
+        self.risk_aversion = getattr(s, "risk_aversion", 1.0)
         
         # Barra-specific parameters
         self.factor_names = getattr(s, "factor_names", None)
@@ -158,18 +162,22 @@ class Simulation:
                 # Get historical returns for MVO
                 returns_data = self._get_historical_returns(date, x.index)
                 
+                # Baseline: flexible-weight portfolio for the current date
+                flex_weights_raw = self._get_flexible_weights(x)
+
                 if returns_data is None or returns_data.empty:
-                    # Fall back to factor-only weights if no historical data
-                    combined_weights = x.fillna(0)
+                    # Not enough data ⇒ use flexible weights
+                    combined_weights = flex_weights_raw
                 else:
-                    # Calculate composite factor weights (inline)
-                    factor_weights = x.fillna(0)
-                    
                     # Calculate MVO weights
                     mvo_weights = self._calculate_mvo_weights(returns_data, prev_weights)
-                    
-                    # Combine weights
-                    combined_weights = self._combine_weights(factor_weights, mvo_weights, x.index)
+
+                    # If optimization failed or produced near-zero weights, fall back to flexible weights
+                    if mvo_weights is None or mvo_weights.abs().sum() < 1e-12:
+                        combined_weights = flex_weights_raw
+                    else:
+                        # Blend flexible and MVO weights using the factor_weight hyper-parameter
+                        combined_weights = self._combine_weights(flex_weights_raw, mvo_weights, x.index)
                 
                 # Process weights (normalize and apply constraints)
                 weights = self._process_weights(combined_weights)
@@ -222,7 +230,7 @@ class Simulation:
             symbols: List of symbols to get returns for
             
         Returns:
-            pd.DataFrame: Historical returns matrix (dates x symbols)
+            pd.DataFrame: Historical returns matrix (dates x symbols), or None if insufficient data
         """
         try:
             # Cache all_dates computation (only done once per simulation)
@@ -232,11 +240,11 @@ class Simulation:
                 self._date_to_idx = {date: idx for idx, date in enumerate(self._cached_dates)}
             
             date_idx = self._date_to_idx.get(current_date)
-            if date_idx is None or date_idx < self.mvo_window:
+            if date_idx is None or date_idx < self.historical_window:
                 return None
                 
             # Get historical window indices
-            start_idx = max(0, date_idx - self.mvo_window)
+            start_idx = max(0, date_idx - self.historical_window)
             historical_dates = self._cached_dates[start_idx:date_idx]
             
             # Use more efficient indexing with loc and boolean masks
@@ -268,7 +276,7 @@ class Simulation:
             result = returns_matrix[valid_symbols]
             
             # Ensure we have the minimum required data
-            if result.shape[0] < min(10, self.mvo_window // 2):
+            if result.shape[0] < min(10, self.historical_window // 2):
                 return None
                 
             return result
@@ -276,6 +284,31 @@ class Simulation:
         except Exception as e:
             warnings.warn(f"Error getting historical returns: {str(e)}")
             return None
+
+    def _get_flexible_weights(self, factor_values):
+        """
+        Generate flexible weights similar to the flexible weight method.
+        This preserves the actual factor magnitudes for better performance during warm-up periods.
+        
+        Args:
+            factor_values: pd.Series of factor values
+            
+        Returns:
+            pd.Series: Flexible weights preserving factor magnitudes
+        """
+        w = pd.Series(0.0, index=factor_values.index)
+        pos = factor_values[factor_values > 0]
+        neg = factor_values[factor_values < 0]
+
+        # If one leg is missing, remain flat (all zeros)
+        if pos.empty or neg.empty:
+            return w
+
+        # Otherwise assign raw magnitudes
+        w[pos.index] = pos
+        w[neg.index] = neg
+
+        return w
 
     def _calculate_mvo_weights(self, returns_data, prev_weights):
         """
@@ -416,19 +449,24 @@ class Simulation:
         aligned_factor = factor_weights.reindex(symbols, fill_value=0.0)
         aligned_optimization = optimization_weights.reindex(symbols, fill_value=0.0)
         
-        # Vectorized normalization (faster than pandas operations)
-        factor_values = aligned_factor.values
-        factor_std = np.std(factor_values)
-        
-        if factor_std > 1e-8:
-            factor_mean = np.mean(factor_values)
-            factor_values = (factor_values - factor_mean) / factor_std
-            factor_values = np.clip(factor_values, -3, 3)  # Clip outliers
-            aligned_factor = pd.Series(factor_values, index=symbols)
-        
-        # Combine using tunable parameter (vectorized)
-        combined_weights = (self.factor_weight * aligned_factor + 
-                          (1 - self.factor_weight) * aligned_optimization)
+        # ---- Normalise each leg to comparable scale ----
+        # 1) Z-score the raw factor values then clip extreme outliers
+        fv = aligned_factor.values
+        fv_std = np.std(fv)
+        if fv_std > 1e-8:
+            fv = (fv - np.mean(fv)) / fv_std
+            fv = np.clip(fv, -3, 3)
+        aligned_factor = pd.Series(fv, index=symbols)
+
+        # 2) Bring both series to market-neutral normalisation so that
+        #    long and short legs each sum to ±1. This puts them on the same scale
+        #    before blending.
+        aligned_factor_norm = self._normalize_weights(aligned_factor)
+        aligned_opt_norm    = self._normalize_weights(aligned_optimization)
+
+        # ---- Blend ----
+        combined_weights = (self.factor_weight * aligned_factor_norm +
+                            (1 - self.factor_weight) * aligned_opt_norm)
         
         return combined_weights
 
@@ -640,22 +678,22 @@ class Simulation:
                 # Get historical returns for Barra
                 returns_data = self._get_historical_returns(date, x.index)
                 
+                # Baseline: flexible-weight portfolio for the current date
+                flex_weights_raw = self._get_flexible_weights(x)
+
                 if returns_data is None or returns_data.empty:
-                    # Fall back to factor-only weights if no historical data
-                    combined_weights = x.fillna(0)
+                    # Not enough data ⇒ use flexible weights
+                    combined_weights = flex_weights_raw
                 else:
-                    # Calculate composite factor weights (inline)
-                    factor_weights = x.fillna(0)
-                    
                     # Calculate Barra weights
-                    barra_weights = self._calculate_barra_weights(date, x.index)
+                    barra_weights = self._calculate_barra_weights(date, x.index, prev_weights)
                     
-                    if barra_weights is None or barra_weights.empty:
-                        # Fall back to factor-only weights if Barra calculation fails
-                        combined_weights = factor_weights
+                    # If Barra weights unavailable or near-zero, fall back to flexible weights
+                    if barra_weights is None or barra_weights.empty or barra_weights.abs().sum() < 1e-12:
+                        combined_weights = flex_weights_raw
                     else:
-                        # Combine weights
-                        combined_weights = self._combine_weights(factor_weights, barra_weights, x.index)
+                        # Blend flexible and Barra weights
+                        combined_weights = self._combine_weights(flex_weights_raw, barra_weights, x.index)
                 
                 # Process weights (normalize and apply constraints)
                 weights = self._process_weights(combined_weights)
@@ -688,14 +726,14 @@ class Simulation:
                     weights_list.append(carried)
                     count_list.append({"date": date, **prev_counts})
                 else:
-                    # Use factor-based fallback
-                    factor_weights = self._process_weights(x.fillna(0))
-                    factor_weights.index = pd.MultiIndex.from_product(
-                        [[date], factor_weights.index],
+                    # Use flexible weights fallback during warm-up
+                    flex_weights = self._process_weights(self._get_flexible_weights(x))
+                    flex_weights.index = pd.MultiIndex.from_product(
+                        [[date], flex_weights.index],
                         names=["date", "symbol"]
                     )
-                    weights_list.append(factor_weights)
-                    count_list.append({"date": date, "long_count": int((factor_weights > 0).sum()), "short_count": int((factor_weights < 0).sum())})
+                    weights_list.append(flex_weights)
+                    count_list.append({"date": date, "long_count": int((flex_weights > 0).sum()), "short_count": int((flex_weights < 0).sum())})
 
         if not weights_list:
             # Return empty results if no weights were generated
@@ -708,7 +746,7 @@ class Simulation:
         counts_df = pd.DataFrame(count_list).set_index("date")
         return shifted, counts_df
 
-    def _calculate_barra_weights(self, current_date, symbols):
+    def _calculate_barra_weights(self, current_date, symbols, prev_weights=None):
         """
         Calculate Barra-style portfolio weights using multi-factor risk model.
         
@@ -822,31 +860,50 @@ class Simulation:
             # Step 4: Solve optimization (reuse existing pattern)
             mu = expected_returns.values
             
-            # Try analytical solution first
-            try:
-                ones = np.ones(n_assets)
-                inv_Sigma = np.linalg.inv(Sigma)
-                A = ones.T @ inv_Sigma @ ones
-                B_scalar = mu.T @ inv_Sigma @ ones
-                
-                if A > 1e-10:
-                    lambda_mult = B_scalar / A
-                    weights = (inv_Sigma @ mu - lambda_mult * inv_Sigma @ ones) / self.barra_risk_aversion
+            # Pre-align previous weights for turnover penalty (similar to MVO)
+            aligned_prev = np.zeros(n_assets)
+            if prev_weights is not None and not prev_weights.empty:
+                for i, symbol in enumerate(available_symbols):
+                    if symbol in prev_weights.index:
+                        aligned_prev[i] = prev_weights[symbol]
+            
+            # Try analytical solution first (when no turnover penalty)
+            if self.turnover_penalty == 0 or prev_weights is None or prev_weights.empty:
+                try:
+                    ones = np.ones(n_assets)
+                    inv_Sigma = np.linalg.inv(Sigma)
+                    A = ones.T @ inv_Sigma @ ones
+                    B_scalar = mu.T @ inv_Sigma @ ones
                     
-                    # Apply constraints
-                    max_weight = min(0.1, 2.0 / n_assets)
-                    weights = np.clip(weights, -max_weight, max_weight)
-                    if np.sum(weights) != 0:
-                        weights = weights - np.sum(weights) / n_assets
-                    
-                    return pd.Series(weights, index=available_symbols)
-                    
-            except (np.linalg.LinAlgError, ValueError):
-                pass
+                    if A > 1e-10:
+                        lambda_mult = B_scalar / A
+                        weights = (inv_Sigma @ mu - lambda_mult * inv_Sigma @ ones) / self.barra_risk_aversion
+                        
+                        # Apply constraints
+                        max_weight = min(0.1, 2.0 / n_assets)
+                        weights = np.clip(weights, -max_weight, max_weight)
+                        if np.sum(weights) != 0:
+                            weights = weights - np.sum(weights) / n_assets
+                        
+                        return pd.Series(weights, index=available_symbols)
+                        
+                except (np.linalg.LinAlgError, ValueError):
+                    pass  # Fall back to numerical optimization
             
             # Fallback to numerical optimization
             def objective(w):
-                return -np.dot(w, mu) + 0.5 * self.barra_risk_aversion * np.dot(w, np.dot(Sigma, w))
+                portfolio_return = np.dot(w, mu)
+                portfolio_variance = np.dot(w, np.dot(Sigma, w))
+                
+                # Mean-variance objective (negative because we minimize)
+                objective_value = -portfolio_return + 0.5 * self.barra_risk_aversion * portfolio_variance
+                
+                # Add turnover penalty (similar to MVO)
+                if self.turnover_penalty > 0:
+                    turnover = np.sum(np.abs(w - aligned_prev))
+                    objective_value += self.turnover_penalty * turnover
+                
+                return objective_value
             
             max_weight = min(0.1, 2.0 / n_assets)
             bounds = [(-max_weight, max_weight)] * n_assets
@@ -881,103 +938,115 @@ class Simulation:
             return None
 
     def _equal_weight_daily_trade_list(self):
+        """
+        Equal-weight long/short portfolio built directly from the composite factor.
+
+        Rules per date:
+        1. Long all names with factor > 0, short all names with factor < 0.
+        2. Keep only the top ``pct`` fraction of candidates in each leg.
+        3. Allocate equal weight within each leg so that longs sum to +1 and shorts to ‑1.
+        4. If either leg is empty (no positive or no negative values) the strategy stays flat
+           that day (no positions, no carry-forward).
+        5. No previous-day portfolio is ever carried forward.
+        """
         weights_list, count_list = [], []
-        prev_weights = pd.Series(dtype=float)
-        prev_long = prev_short = np.nan
 
         for date, group in tqdm(self.custom_feature.groupby(level="date"), desc="Equal Weight Simulation"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    # Use consistent count storage
-                    prev_counts = {"long_count": prev_long, "short_count": prev_short}
-                    count_list.append({"date": date, **prev_counts})
+            x = group.droplevel('date')  # factor series already has fillna(0)
+
+            # Separate positive and negative signals; zeros are ignored.
+            pos = x[x > 0]
+            neg = x[x < 0]
+
+            # If one leg is missing, store explicit zero weights so that shift(1)
+            # keeps the timing alignment (we stay flat next day).
+            if pos.empty or neg.empty:
+                zero_w = pd.Series(0.0, index=x.index)
+                zero_w.index = pd.MultiIndex.from_product(
+                    [[date], zero_w.index],
+                    names=["date", "symbol"]
+                )
+                weights_list.append(zero_w)
+                count_list.append({"date": date, "long_count": 0, "short_count": 0})
                 continue
 
-            n = len(x)
-            k = max(int(np.floor(n * self.pct)), 1)
-            ranked = x.rank(method="first", ascending=False)
+            # Select the strongest pct of each side
+            k_long = max(int(np.floor(len(pos) * self.pct)), 1)
+            k_short = max(int(np.floor(len(neg) * self.pct)), 1)
 
-            long_mask = (ranked <= k)
-            short_mask = (ranked > n - k)
+            top_pos = pos.sort_values(ascending=False).iloc[:k_long]
+            top_neg = neg.sort_values().iloc[:k_short]  # most negative values first
 
-            longs = long_mask.astype(float)
-            shorts = short_mask.astype(float)
-            
-            # Create raw weights (no normalization here - _process_weights handles it)
-            weights = longs - shorts
-            long_count = int(long_mask.sum())
-            short_count = int(short_mask.sum())
+            # Allocate equal weights
+            weights = pd.Series(0.0, index=x.index)
+            weights[top_pos.index] = 1.0 / k_long
+            weights[top_neg.index] = -1.0 / k_short
 
-            # Process weights (normalize and apply constraints)
-            weights = self._process_weights(weights)
+            long_count, short_count = k_long, k_short
 
-            prev_weights = weights
-            prev_long, prev_short = long_count, short_count
-
-            # annotate date level
+            # Stamp the date on the index
             weights.index = pd.MultiIndex.from_product(
                 [[date], weights.index],
                 names=["date", "symbol"]
             )
+
             weights_list.append(weights)
             count_list.append({"date": date,
                                "long_count": long_count,
                                "short_count": short_count})
 
         all_w = pd.concat(weights_list).sort_index()
+        # Shift by 1 day so weights are implemented the next trading day
         shifted = all_w.groupby("symbol").shift(1)
         counts_df = pd.DataFrame(count_list).set_index("date")
         return shifted, counts_df
 
     def _flexible_weight_daily_trade_list(self):
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
+        """
+        Flexible-weight portfolio:
+            • Long names with factor > 0; weight proportional to factor value.
+            • Short names with factor < 0; weight proportional to |factor value|.
+            • Execute only if *both* long and short sides have at least one asset.
+            • Long leg normalised to +1, short leg to –1 by _process_weights.
+            • No min-universe requirement, no carry-forward of old positions.
+        """
+        weights_list, count_list = [], []
 
         for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="Flexible Weight Simulation"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
+            x = group.droplevel('date')  # zeros already present, we keep them
+
+            pos = x[x > 0]
+            neg = x[x < 0]
+
+            # If one leg is missing, store explicit zero weights so that shift(1)
+            # keeps timing alignment (flat exposure next day).
+            if pos.empty or neg.empty:
+                zero_w = pd.Series(0.0, index=x.index)
+                zero_w.index = pd.MultiIndex.from_product(
+                    [[date], zero_w.index],
+                    names=["date", "symbol"]
+                )
+                weights_list.append(zero_w)
+                count_list.append({"date": date, "long_count": 0, "short_count": 0})
                 continue
 
+            # Raw weights proportional to factor
             w = pd.Series(0.0, index=x.index)
-            pos, neg = x[x>0], x[x<0]
-            
-            # Create raw weights (no normalization here - _process_weights handles it)
-            if not pos.empty:
-                w[pos.index] = pos
-            if not neg.empty:
-                w[neg.index] = neg
+            w[pos.index] = pos
+            w[neg.index] = neg
 
-            long_count  = int((w>0).sum())
-            short_count = int((w<0).sum())
-            
-            # Process weights (normalize and apply constraints)
+            long_count = len(pos)
+            short_count = len(neg)
+
+            # Normalise & cap
             w = self._process_weights(w)
 
-            prev_weights = w
-            prev_counts = {"long_count": long_count, "short_count": short_count}
-
+            # Attach date level
             w.index = pd.MultiIndex.from_product(
                 [[date], w.index],
                 names=["date", "symbol"]
             )
+
             weights_list.append(w)
             count_list.append({"date": date,
                                "long_count": long_count,
@@ -1021,18 +1090,22 @@ class Simulation:
                 # Get historical returns for PCA-MVO
                 returns_data = self._get_historical_returns(date, x.index)
                 
+                # Baseline: flexible-weight portfolio for the current date
+                flex_weights_raw = self._get_flexible_weights(x)
+
                 if returns_data is None or returns_data.empty:
-                    # Fall back to factor-only weights if no historical data
-                    combined_weights = x.fillna(0)
+                    # Not enough data ⇒ use flexible weights
+                    combined_weights = flex_weights_raw
                 else:
-                    # Calculate composite factor weights (inline)
-                    factor_weights = x.fillna(0)
-                    
                     # Calculate PCA-MVO weights
                     pca_mvo_weights = self._calculate_pca_mvo_weights(returns_data, prev_weights)
                     
-                    # Combine weights
-                    combined_weights = self._combine_weights(factor_weights, pca_mvo_weights, x.index)
+                    # If PCA-MVO weights unavailable or near-zero, fall back to flexible weights
+                    if pca_mvo_weights is None or pca_mvo_weights.abs().sum() < 1e-12:
+                        combined_weights = flex_weights_raw
+                    else:
+                        # Blend flexible and PCA-MVO weights
+                        combined_weights = self._combine_weights(flex_weights_raw, pca_mvo_weights, x.index)
                 
                 # Process weights (normalize and apply constraints)
                 weights = self._process_weights(combined_weights)
