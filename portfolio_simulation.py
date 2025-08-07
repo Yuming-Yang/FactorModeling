@@ -3,8 +3,9 @@ import pandas as pd
 from portfolio_analyzer import PortfolioAnalyzer
 from dataclasses import dataclass
 from tqdm import tqdm
-from scipy.optimize import minimize
 import warnings
+from scipy.optimize import minimize
+import cvxpy as cp
 
 @dataclass
 class SimulationSettings:
@@ -13,35 +14,22 @@ class SimulationSettings:
     cap_flag: pd.Series            # MultiIndex (date, symbol)
     investability_flag: pd.Series  # MultiIndex (date, symbol)
     factors_df: pd.DataFrame       # your factor DataFrame
-    single_factor_returns: pd.DataFrame # date
-    
     # simulation parameters (with defaults)
-    method: str = 'equal'          # 'equal' | 'linear' | 'mvo' | 'barra' | 'pca_mvo'
+    method: str = 'equal'          # 'equal' | 'linear' | 'mvo' | 'mvo_turnover'
     transaction_cost: bool = True
-    max_weight: float = 0.01
+    max_weight: float = 0.03
     pct: float = 0.1
     min_universe: int = 1000
     contributor: bool = False
     output_summary: bool = False
     output_returns: bool = False
     plot: bool = True
-    original_factors: pd.DataFrame = None
-    
-    # shared optimization parameters (used by MVO, PCA-MVO, Barra)
-    historical_window: int = 60    # look-back window for historical returns estimation
-    turnover_penalty: float = 5.0  # penalty for portfolio turnover (higher = less turnover)
-    factor_weight: float = 0.5     # weight for composite factor vs optimization (0.0 = pure optimization, 1.0 = pure factor)
-    
-    # MVO/PCA-MVO parameters
-    risk_aversion: float = 1.0      # risk aversion parameter for MVO and PCA-MVO (higher = more conservative)
-    
-    # PCA-MVO specific parameters
-    pca_n_components: int = 10      # number of PCA components for PCA-MVO
-    
-    # Barra-style parameters
-    barra_risk_aversion: float = 1.0  # risk aversion for Barra optimization (higher = more conservative)
-    barra_window: int = 60         # look-back window for factor return estimation in Barra model
-    factor_names: list = None       # list of factor names to use for Barra optimization (None = use all available)
+    # MVO-specific parameters
+    lookback_period: int = 60      # days to look back for variance calculation
+    use_cvxpy: bool = True         # use CVXPY instead of scipy for faster optimization
+    mvo_solver: str = 'OSQP'       # CVXPY solver: 'OSQP' (fastest), 'ECOS', 'SCS'
+    shrinkage_intensity: float = 0.1  # shrinkage intensity for covariance regularization
+    turnover_penalty: float = 0.1     # penalty weight for turnover in MVO with turnover optimization
 
 class Simulation:
     """
@@ -72,23 +60,11 @@ class Simulation:
         self.output_summary     = s.output_summary
         self.output_returns     = s.output_returns
         self.plot               = s.plot
-        self.single_factor_returns = s.single_factor_returns
-        self.original_factors     = s.original_factors
-
-        # Shared optimization parameters
-        self.historical_window = getattr(s, "historical_window", getattr(s, "mvo_window", 60))  # backward compatibility
-        self.turnover_penalty = getattr(s, "turnover_penalty", 5.0)
-        self.factor_weight = getattr(s, "factor_weight", 0.5)
-        
-        # MVO/PCA-MVO parameters
-        self.risk_aversion = getattr(s, "risk_aversion", 1.0)
-        
-        # Barra-specific parameters
-        self.factor_names = getattr(s, "factor_names", None)
-        self.barra_window = getattr(s, "barra_window", 252)
-        self.barra_risk_aversion = getattr(s, "barra_risk_aversion", 1.0)
-        # PCA-MVO parameters
-        self.pca_n_components = getattr(s, "pca_n_components", 10)
+        self.lookback_period    = s.lookback_period
+        self.use_cvxpy          = s.use_cvxpy
+        self.mvo_solver         = s.mvo_solver
+        self.shrinkage_intensity = s.shrinkage_intensity
+        self.turnover_penalty = s.turnover_penalty
 
     def run(self):
         self.factors_df[self.name] = self.custom_feature
@@ -116,1091 +92,173 @@ class Simulation:
         return None
 
     def _daily_trade_list(self):
-        if self.method == 'equal':
-            return self._equal_weight_daily_trade_list()
-        elif self.method == 'linear':
-            return self._flexible_weight_daily_trade_list()
-        elif self.method == 'mvo':
-            return self._optimal_weight_daily_trade_list()
-        elif self.method == 'barra':
-            return self._barra_style_daily_trade_list()
-        elif self.method == 'pca_mvo':
-            return self._pca_mvo_daily_trade_list()
-        else:
-            raise ValueError(f"Unknown method {self.method}")
-        
-    def _optimal_weight_daily_trade_list(self):
-        """
-        Mean-Variance Optimization combined with composite factor weighting.
-        
-        Process:
-        1. Calculate composite factor weights for each date
-        2. Apply mean-variance optimization on historical returns 
-        3. Combine both weights using tunable parameter
-        4. Process and return final weights
-        """
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
-
-        for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="MVO Weight Simulation"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-
-            try:
-                # Get historical returns for MVO
-                returns_data = self._get_historical_returns(date, x.index)
-                
-                # Baseline: flexible-weight portfolio for the current date
-                flex_weights_raw = self._get_flexible_weights(x)
-
-                if returns_data is None or returns_data.empty:
-                    # Not enough data ⇒ use flexible weights
-                    combined_weights = flex_weights_raw
-                else:
-                    # Calculate MVO weights
-                    mvo_weights = self._calculate_mvo_weights(returns_data, prev_weights)
-
-                    # If optimization failed or produced near-zero weights, fall back to flexible weights
-                    if mvo_weights is None or mvo_weights.abs().sum() < 1e-12:
-                        combined_weights = flex_weights_raw
-                    else:
-                        # Blend flexible and MVO weights using the factor_weight hyper-parameter
-                        combined_weights = self._combine_weights(flex_weights_raw, mvo_weights, x.index)
-                
-                # Process weights (normalize and apply constraints)
-                weights = self._process_weights(combined_weights)
-                
-                # Count positions
-                long_count = int((weights > 0).sum())
-                short_count = int((weights < 0).sum())
-                
-                prev_weights = weights
-                prev_counts = {"long_count": long_count, "short_count": short_count}
-
-                # annotate date level
-                weights.index = pd.MultiIndex.from_product(
-                    [[date], weights.index],
-                    names=["date", "symbol"]
-                )
-                weights_list.append(weights)
-                count_list.append({"date": date,
-                                   "long_count": long_count,
-                                   "short_count": short_count})
-                                   
-            except Exception as e:
-                warnings.warn(f"MVO optimization failed for date {date}: {str(e)}. Using previous weights.")
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-
-        if not weights_list:
-            # Return empty results if no weights were generated
-            empty_weights = pd.Series(dtype=float)
-            empty_counts = pd.DataFrame(columns=["long_count", "short_count"])
-            return empty_weights, empty_counts
-
-        all_w = pd.concat(weights_list).sort_index()
-        shifted = all_w.groupby("symbol").shift(1)
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        return shifted, counts_df
-
-    def _get_historical_returns(self, current_date, symbols):
-        """
-        Get historical returns for mean-variance optimization (optimized version).
-        
-        Args:
-            current_date: Current date for which to get historical data
-            symbols: List of symbols to get returns for
-            
-        Returns:
-            pd.DataFrame: Historical returns matrix (dates x symbols), or None if insufficient data
-        """
-        try:
-            # Cache all_dates computation (only done once per simulation)
-            if not hasattr(self, '_cached_dates'):
-                self._cached_dates = self.returns.index.get_level_values('date').unique().sort_values()
-                # Pre-compute date to index mapping for fast lookups
-                self._date_to_idx = {date: idx for idx, date in enumerate(self._cached_dates)}
-            
-            date_idx = self._date_to_idx.get(current_date)
-            if date_idx is None or date_idx < self.historical_window:
-                return None
-                
-            # Get historical window indices
-            start_idx = max(0, date_idx - self.historical_window)
-            historical_dates = self._cached_dates[start_idx:date_idx]
-            
-            # Use more efficient indexing with loc and boolean masks
-            date_mask = self.returns.index.get_level_values('date').isin(historical_dates)
-            symbol_mask = self.returns.index.get_level_values('symbol').isin(symbols)
-            
-            # Extract returns efficiently 
-            returns_subset = self.returns.loc[date_mask & symbol_mask]
-            
-            if returns_subset.empty:
-                return None
-            
-            # Faster pivot using unstack with better memory handling
-            returns_matrix = returns_subset.unstack(level='symbol', fill_value=0.0)
-            
-            # Vectorized symbol filtering (much faster than loops)
-            if returns_matrix.empty:
-                return None
-                
-            # Keep only symbols with sufficient data (vectorized)
-            min_observations = min(10, len(historical_dates) // 2)
-            non_zero_counts = (returns_matrix != 0).sum(axis=0)
-            valid_mask = non_zero_counts >= min_observations
-            
-            if valid_mask.sum() < 2:
-                return None
-                
-            valid_symbols = returns_matrix.columns[valid_mask]
-            result = returns_matrix[valid_symbols]
-            
-            # Ensure we have the minimum required data
-            if result.shape[0] < min(10, self.historical_window // 2):
-                return None
-                
-            return result
-            
-        except Exception as e:
-            warnings.warn(f"Error getting historical returns: {str(e)}")
-            return None
-
-    def _get_flexible_weights(self, factor_values):
-        """
-        Generate flexible weights similar to the flexible weight method.
-        This preserves the actual factor magnitudes for better performance during warm-up periods.
-        
-        Args:
-            factor_values: pd.Series of factor values
-            
-        Returns:
-            pd.Series: Flexible weights preserving factor magnitudes
-        """
-        w = pd.Series(0.0, index=factor_values.index)
-        pos = factor_values[factor_values > 0]
-        neg = factor_values[factor_values < 0]
-
-        # If one leg is missing, remain flat (all zeros)
-        if pos.empty or neg.empty:
-            return w
-
-        # Otherwise assign raw magnitudes
-        w[pos.index] = pos
-        w[neg.index] = neg
-
-        return w
-
-    def _calculate_mvo_weights(self, returns_data, prev_weights):
-        """
-        Calculate mean-variance optimal weights (optimized version).
-        
-        Args:
-            returns_data: pd.DataFrame of historical returns (dates x symbols)
-            prev_weights: pd.Series of previous weights for turnover penalty
-            
-        Returns:
-            pd.Series: MVO optimal weights
-        """
-        try:
-            n_assets = len(returns_data.columns)
-            if n_assets < 2:
-                return pd.Series(0.0, index=returns_data.columns)
-            
-            # Convert to numpy for faster computation
-            returns_matrix = returns_data.values
-            expected_returns = np.mean(returns_matrix, axis=0)
-            
-            # Calculate covariance matrix (faster)
-            cov_matrix = np.cov(returns_matrix.T)
-            
-            # Fast regularization: simple diagonal loading (much faster than eigenvalue computation)
-            reg_param = max(1e-8, 0.001 * np.trace(cov_matrix) / n_assets)
-            cov_matrix += reg_param * np.eye(n_assets)
-            
-            # Pre-align previous weights to avoid repeated operations in objective
-            aligned_prev = np.zeros(n_assets)
-            if prev_weights is not None and not prev_weights.empty:
-                for i, symbol in enumerate(returns_data.columns):
-                    if symbol in prev_weights.index:
-                        aligned_prev[i] = prev_weights[symbol]
-            
-            # Try analytical solution first for speed (when no turnover penalty)
-            if self.turnover_penalty == 0 or prev_weights is None or prev_weights.empty:
-                # Analytical mean-variance solution for market-neutral portfolio
-                try:
-                    # Solve: minimize w'Σw subject to w'1 = 0 and incorporate expected returns
-                    ones = np.ones(n_assets)
-                    inv_cov = np.linalg.inv(cov_matrix)
-                    
-                    # Market neutral analytical solution with return consideration
-                    A = ones.T @ inv_cov @ ones
-                    B = expected_returns.T @ inv_cov @ ones  
-                    C = expected_returns.T @ inv_cov @ expected_returns
-                    
-                    if A > 1e-10:  # Avoid division by zero
-                        # Optimal weights for market neutral portfolio
-                        lambda_mult = B / A
-                        weights = (inv_cov @ expected_returns - lambda_mult * inv_cov @ ones) / self.risk_aversion
-                        
-                        # Apply position limits
-                        max_single_weight = min(0.1, 2.0 / n_assets)
-                        weights = np.clip(weights, -max_single_weight, max_single_weight)
-                        
-                        # Renormalize to market neutral
-                        if np.sum(weights) != 0:
-                            weights = weights - np.sum(weights) / n_assets
-                        
-                        return pd.Series(weights, index=returns_data.columns)
-                        
-                except (np.linalg.LinAlgError, ValueError):
-                    pass  # Fall back to numerical optimization
-            
-            # Numerical optimization (faster version)
-            def objective(weights):
-                portfolio_return = np.dot(weights, expected_returns)
-                portfolio_variance = np.dot(weights, np.dot(cov_matrix, weights))
-                
-                # Mean-variance objective (negative because we minimize)
-                objective_value = -portfolio_return + 0.5 * self.risk_aversion * portfolio_variance
-                
-                # Add turnover penalty (pre-aligned weights)
-                if self.turnover_penalty > 0:
-                    turnover = np.sum(np.abs(weights - aligned_prev))
-                    objective_value += self.turnover_penalty * turnover
-                
-                return objective_value
-            
-            # Faster optimizer: L-BFGS-B (generally faster than SLSQP for unconstrained problems)
-            max_single_weight = min(0.1, 2.0 / n_assets)
-            bounds = [(-max_single_weight, max_single_weight) for _ in range(n_assets)]
-            
-            # Better initial guess: equal long-short based on expected returns
-            ranked_returns = np.argsort(-expected_returns)  # Descending order
-            x0 = np.zeros(n_assets)
-            n_long = max(1, n_assets // 4)
-            n_short = max(1, n_assets // 4)
-            x0[ranked_returns[:n_long]] = 1.0 / n_long
-            x0[ranked_returns[-n_short:]] = -1.0 / n_short
-            
-            # Solve optimization with L-BFGS-B
-            result = minimize(
-                objective, 
-                x0, 
-                method='L-BFGS-B', 
-                bounds=bounds,
-                options={'maxiter': 500, 'ftol': 1e-6}  # Reduced tolerance for speed
-            )
-            
-            if result.success:
-                optimal_weights = pd.Series(result.x, index=returns_data.columns)
-            else:
-                # Fallback to equal long-short if optimization fails
-                warnings.warn(f"MVO optimization failed: {result.message}. Using fallback weights.")
-                optimal_weights = pd.Series(0.0, index=returns_data.columns)
-                
-                # Simple long-short based on expected returns
-                if len(expected_returns) > 0:
-                    ranked_returns = expected_returns.rank(ascending=False)
-                    n_long = max(1, len(expected_returns) // 4)
-                    n_short = max(1, len(expected_returns) // 4)
-                    
-                    optimal_weights[ranked_returns <= n_long] = 1.0 / n_long
-                    optimal_weights[ranked_returns > len(expected_returns) - n_short] = -1.0 / n_short
-            
-            return optimal_weights
-            
-        except Exception as e:
-            warnings.warn(f"Error in MVO calculation: {str(e)}")
-            return pd.Series(0.0, index=returns_data.columns)
-
-    def _combine_weights(self, factor_weights, optimization_weights, symbols):
-        """
-        Combine factor weights and optimization weights using tunable parameter (optimized).
-        
-        Args:
-            factor_weights: pd.Series of factor-based weights
-            optimization_weights: pd.Series of optimization weights (MVO, Barra, PCA-MVO, etc.)
-            symbols: Index of symbols to ensure alignment
-            
-        Returns:
-            pd.Series: Combined weights
-        """
-        # Use reindex for faster alignment (avoids loops)
-        aligned_factor = factor_weights.reindex(symbols, fill_value=0.0)
-        aligned_optimization = optimization_weights.reindex(symbols, fill_value=0.0)
-        
-        # ---- Normalise each leg to comparable scale ----
-        # 1) Z-score the raw factor values then clip extreme outliers
-        fv = aligned_factor.values
-        fv_std = np.std(fv)
-        if fv_std > 1e-8:
-            fv = (fv - np.mean(fv)) / fv_std
-            fv = np.clip(fv, -3, 3)
-        aligned_factor = pd.Series(fv, index=symbols)
-
-        # 2) Bring both series to market-neutral normalisation so that
-        #    long and short legs each sum to ±1. This puts them on the same scale
-        #    before blending.
-        aligned_factor_norm = self._normalize_weights(aligned_factor)
-        aligned_opt_norm    = self._normalize_weights(aligned_optimization)
-
-        # ---- Blend ----
-        combined_weights = (self.factor_weight * aligned_factor_norm +
-                            (1 - self.factor_weight) * aligned_opt_norm)
-        
-        return combined_weights
-
-    def _calculate_pca_mvo_weights(self, returns_data, prev_weights):
-        """
-        Calculate PCA-based mean-variance optimal weights.
-        
-        This method applies Principal Component Analysis to reduce the dimensionality
-        of the covariance matrix, performs optimization in the reduced space,
-        then maps the solution back to the original asset space.
-        
-        Args:
-            returns_data: pd.DataFrame of historical returns (dates x symbols)
-            prev_weights: pd.Series of previous weights for turnover penalty
-            
-        Returns:
-            pd.Series: PCA-MVO optimal weights
-        """
-        try:
-            n_assets = len(returns_data.columns)
-            if n_assets < 2:
-                return pd.Series(0.0, index=returns_data.columns)
-            
-            # If we have fewer assets than PCA components, fall back to regular MVO
-            if n_assets <= self.pca_n_components:
-                warnings.warn(f"Number of assets ({n_assets}) <= PCA components ({self.pca_n_components}). Using regular MVO.")
-                return self._calculate_mvo_weights(returns_data, prev_weights)
-            
-            # Convert to numpy for faster computation
-            returns_matrix = returns_data.values
-            expected_returns = np.mean(returns_matrix, axis=0)
-            
-            # Calculate covariance matrix
-            cov_matrix = np.cov(returns_matrix.T)
-            
-            # Apply PCA to the covariance matrix (eigenvalue decomposition)
-            # Use faster eigh with subset selection
-            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-            
-            # Sort eigenvalues and eigenvectors in descending order (vectorized)
-            sorted_indices = np.argsort(eigenvalues)[::-1]
-            eigenvalues = eigenvalues[sorted_indices]
-            eigenvectors = eigenvectors[:, sorted_indices]
-            
-            # Select top k components
-            n_components = min(self.pca_n_components, len(eigenvalues))
-            selected_eigenvalues = eigenvalues[:n_components]
-            selected_eigenvectors = eigenvectors[:, :n_components]
-            
-            # Create reduced covariance matrix in PCA space
-            # Σ_reduced = Λ (diagonal matrix of selected eigenvalues)
-            reduced_cov = np.diag(selected_eigenvalues)
-            
-            # Project expected returns into PCA space (vectorized)
-            # μ_reduced = V^T * μ
-            reduced_returns = selected_eigenvectors.T @ expected_returns
-            
-            # Regularization in reduced space
-            reg_param = max(1e-8, 0.001 * np.trace(reduced_cov) / n_components)
-            reduced_cov += reg_param * np.eye(n_components)
-            
-            # Pre-align previous weights for turnover penalty (vectorized)
-            aligned_prev = np.zeros(n_assets)
-            if prev_weights is not None and not prev_weights.empty:
-                # Vectorized alignment
-                common_symbols = returns_data.columns.intersection(prev_weights.index)
-                if len(common_symbols) > 0:
-                    symbol_to_idx = {symbol: i for i, symbol in enumerate(returns_data.columns)}
-                    for symbol in common_symbols:
-                        aligned_prev[symbol_to_idx[symbol]] = prev_weights[symbol]
-            
-            # Project previous weights into PCA space (vectorized)
-            reduced_prev_weights = selected_eigenvectors.T @ aligned_prev
-            
-            # Try analytical solution first (when no turnover penalty)
-            if self.turnover_penalty == 0 or prev_weights is None or prev_weights.empty:
-                try:
-                    # Analytical solution in PCA space
-                    ones_reduced = np.ones(n_components)
-                    inv_cov_reduced = np.linalg.inv(reduced_cov)
-                    
-                    # Market neutral analytical solution
-                    A = ones_reduced.T @ inv_cov_reduced @ ones_reduced
-                    B = reduced_returns.T @ inv_cov_reduced @ ones_reduced
-                    
-                    if A > 1e-10:
-                        lambda_mult = B / A
-                        weights_reduced = (inv_cov_reduced @ reduced_returns - 
-                                         lambda_mult * inv_cov_reduced @ ones_reduced) / self.risk_aversion
-                        
-                        # Map back to original space: w = V * w_reduced
-                        weights_original = selected_eigenvectors @ weights_reduced
-                        
-                        # Apply position limits
-                        max_single_weight = min(0.1, 2.0 / n_assets)
-                        weights_original = np.clip(weights_original, -max_single_weight, max_single_weight)
-                        
-                        # Renormalize to market neutral
-                        if np.sum(weights_original) != 0:
-                            weights_original = weights_original - np.sum(weights_original) / n_assets
-                        
-                        return pd.Series(weights_original, index=returns_data.columns)
-                        
-                except (np.linalg.LinAlgError, ValueError):
-                    pass  # Fall back to numerical optimization
-            
-            # Numerical optimization in PCA space (optimized)
-            def objective_pca(weights_reduced):
-                # Portfolio return and variance in PCA space
-                portfolio_return = np.dot(weights_reduced, reduced_returns)
-                portfolio_variance = np.dot(weights_reduced, np.dot(reduced_cov, weights_reduced))
-                
-                # Mean-variance objective
-                objective_value = -portfolio_return + 0.5 * self.risk_aversion * portfolio_variance
-                
-                # Add turnover penalty (optimized - avoid repeated matrix multiplication)
-                if self.turnover_penalty > 0:
-                    # Pre-compute the difference in reduced space
-                    turnover_reduced = np.sum(np.abs(weights_reduced - reduced_prev_weights))
-                    # Scale by approximate factor (this is an approximation but much faster)
-                    objective_value += self.turnover_penalty * turnover_reduced * (n_assets / n_components)
-                
-                return objective_value
-            
-            # Optimization bounds in reduced space (more relaxed since we have fewer variables)
-            max_reduced_weight = min(1.0, 4.0 / n_components)
-            bounds_reduced = [(-max_reduced_weight, max_reduced_weight) for _ in range(n_components)]
-            
-            # Initial guess in PCA space
-            x0_reduced = np.zeros(n_components)
-            if len(reduced_returns) > 0:
-                ranked_returns = np.argsort(-reduced_returns)
-                n_long = max(1, n_components // 4)
-                n_short = max(1, n_components // 4)
-                x0_reduced[ranked_returns[:n_long]] = 1.0 / n_long
-                x0_reduced[ranked_returns[-n_short:]] = -1.0 / n_short
-            
-            # Solve optimization in PCA space
-            result = minimize(
-                objective_pca,
-                x0_reduced,
-                method='L-BFGS-B',
-                bounds=bounds_reduced,
-                options={'maxiter': 500, 'ftol': 1e-6}
-            )
-            
-            if result.success:
-                optimal_weights_original = selected_eigenvectors @ result.x
-                
-                # Apply position limits in original space
-                max_single_weight = min(0.1, 2.0 / n_assets)
-                optimal_weights_original = np.clip(optimal_weights_original, -max_single_weight, max_single_weight)
-                
-                # Renormalize to market neutral
-                if np.sum(optimal_weights_original) != 0:
-                    optimal_weights_original = optimal_weights_original - np.sum(optimal_weights_original) / n_assets
-                
-                optimal_weights = pd.Series(optimal_weights_original, index=returns_data.columns)
-            else:
-                # Fallback to equal long-short if optimization fails (same as original MVO)
-                warnings.warn(f"PCA-MVO optimization failed: {result.message}. Using fallback weights.")
-                optimal_weights = pd.Series(0.0, index=returns_data.columns)
-                
-                # Simple long-short based on expected returns
-                if len(expected_returns) > 0:
-                    ranked_returns = pd.Series(expected_returns, index=returns_data.columns).rank(ascending=False)
-                    n_long = max(1, len(expected_returns) // 4)
-                    n_short = max(1, len(expected_returns) // 4)
-                    
-                    optimal_weights[ranked_returns <= n_long] = 1.0 / n_long
-                    optimal_weights[ranked_returns > len(expected_returns) - n_short] = -1.0 / n_short
-            
-            return optimal_weights
-            
-        except Exception as e:
-            warnings.warn(f"Error in PCA-MVO calculation: {str(e)}")
-            return pd.Series(0.0, index=returns_data.columns)
-
-    def _barra_style_daily_trade_list(self):
-        """
-        Barra-style multi-factor risk model portfolio construction.
-        
-        Process:
-        1. Calculate expected asset returns via: R̂_i = Σ_k β_ik · f_k
-        2. Compute full asset covariance matrix: Σ = BFB^T + D
-        3. Solve mean-variance optimization: max x^T R̂ - (γ/2) x^T Σ x
-        4. Apply constraints: full investment (Σx_i = 1) and optionally long-only
-        """
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
-
-        for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="Barra-style Risk Model Simulation"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
-
-            try:
-                # Get historical returns for Barra
-                returns_data = self._get_historical_returns(date, x.index)
-                
-                # Baseline: flexible-weight portfolio for the current date
-                flex_weights_raw = self._get_flexible_weights(x)
-
-                if returns_data is None or returns_data.empty:
-                    # Not enough data ⇒ use flexible weights
-                    combined_weights = flex_weights_raw
-                else:
-                    # Calculate Barra weights
-                    barra_weights = self._calculate_barra_weights(date, x.index, prev_weights)
-                    
-                    # If Barra weights unavailable or near-zero, fall back to flexible weights
-                    if barra_weights is None or barra_weights.empty or barra_weights.abs().sum() < 1e-12:
-                        combined_weights = flex_weights_raw
-                    else:
-                        # Blend flexible and Barra weights
-                        combined_weights = self._combine_weights(flex_weights_raw, barra_weights, x.index)
-                
-                # Process weights (normalize and apply constraints)
-                weights = self._process_weights(combined_weights)
-                
-                # Count positions
-                long_count = int((weights > 0).sum())
-                short_count = int((weights < 0).sum())
-                
-                prev_weights = weights
-                prev_counts = {"long_count": long_count, "short_count": short_count}
-
-                # annotate date level
-                weights.index = pd.MultiIndex.from_product(
-                    [[date], weights.index],
-                    names=["date", "symbol"]
-                )
-                weights_list.append(weights)
-                count_list.append({"date": date,
-                                   "long_count": long_count,
-                                   "short_count": short_count})
-                                   
-            except Exception as e:
-                warnings.warn(f"Barra optimization failed for date {date}: {str(e)}. Using factor-based fallback.")
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                else:
-                    # Use flexible weights fallback during warm-up
-                    flex_weights = self._process_weights(self._get_flexible_weights(x))
-                    flex_weights.index = pd.MultiIndex.from_product(
-                        [[date], flex_weights.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(flex_weights)
-                    count_list.append({"date": date, "long_count": int((flex_weights > 0).sum()), "short_count": int((flex_weights < 0).sum())})
-
-        if not weights_list:
-            # Return empty results if no weights were generated
-            empty_weights = pd.Series(dtype=float)
-            empty_counts = pd.DataFrame(columns=["long_count", "short_count"])
-            return empty_weights, empty_counts
-
-        all_w = pd.concat(weights_list).sort_index()
-        shifted = all_w.groupby("symbol").shift(1)
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        return shifted, counts_df
-
-    def _calculate_barra_weights(self, current_date, symbols, prev_weights=None):
-        """
-        Calculate Barra-style portfolio weights using multi-factor risk model.
-        
-        Steps:
-        1. Estimate factor exposures (B matrix) via regression of asset returns on factor returns
-        2. Calculate expected asset returns: R̂_i = Σ_k β_ik · f_k  
-        3. Calculate asset covariance matrix: Σ = BFB^T + D
-        4. Solve mean-variance optimization: max x^T R̂ - (γ/2) x^T Σ x
-        """
-        try:
-            # Check if we have factor returns data
-            if self.single_factor_returns is None or self.single_factor_returns.empty:
-                return None
-                
-            # Get factor returns data up to current date
-            factor_data = self.single_factor_returns.loc[self.single_factor_returns.index < current_date]
-            if factor_data.empty:
-                return None
-                
-            # Use lookback window for regression
-            window_size = min(self.barra_window, len(factor_data))
-            recent_factor_returns = factor_data.tail(window_size)
-            
-            # Get asset returns for the same period (reuse existing function)
-            historical_returns = self._get_historical_returns(current_date, symbols)
-            if historical_returns is None or historical_returns.empty:
-                return None
-            
-            # Align the time periods between factor returns and asset returns
-            common_dates = recent_factor_returns.index.intersection(historical_returns.index)
-            if len(common_dates) < 20:  # Need minimum observations for regression
-                return None
-                
-            factor_ret_aligned = recent_factor_returns.loc[common_dates]
-            asset_ret_aligned = historical_returns.loc[common_dates]
-            
-            # Get available symbols and factors
-            available_symbols = asset_ret_aligned.columns.intersection(symbols)
-            available_factors = factor_ret_aligned.columns.dropna()
-            
-            if len(available_symbols) < 2 or len(available_factors) == 0:
-                return None
-            
-            # Step 1: Estimate factor exposures through regression
-            # For each asset, regress returns on factor returns to get betas
-            factor_exposures = pd.DataFrame(index=available_symbols, columns=available_factors)
-            specific_risks = []
-            
-            for symbol in available_symbols:
-                asset_returns = asset_ret_aligned[symbol].dropna()
-                
-                # Align dates for this specific asset
-                asset_dates = factor_ret_aligned.index.intersection(asset_returns.index)
-                if len(asset_dates) < 10:  # Need minimum observations
-                    factor_exposures.loc[symbol] = 0.0
-                    specific_risks.append(0.01)
-                    continue
-                
-                y = asset_returns.loc[asset_dates].values
-                X = factor_ret_aligned.loc[asset_dates].values
-                
-                # Add constant term for regression
-                X_with_const = np.column_stack([np.ones(len(X)), X])
-                
-                try:
-                    # OLS regression: y = α + β₁f₁ + β₂f₂ + ... + ε
-                    betas = np.linalg.lstsq(X_with_const, y, rcond=None)[0]
-                    
-                    # Store factor exposures (exclude intercept)
-                    factor_exposures.loc[symbol] = betas[1:]
-                    
-                    # Calculate specific risk from regression residuals
-                    y_pred = X_with_const @ betas
-                    residuals = y - y_pred
-                    specific_risk = max(np.var(residuals, ddof=len(betas)), 1e-6)
-                    specific_risks.append(specific_risk)
-                    
-                except (np.linalg.LinAlgError, ValueError):
-                    # Fallback if regression fails
-                    factor_exposures.loc[symbol] = 0.0
-                    specific_risks.append(0.01)
-            
-            factor_exposures = factor_exposures.fillna(0.0).astype(float)
-            
-            # Step 2: Calculate expected returns using recent factor returns
-            recent_mean_factor_returns = recent_factor_returns.mean()
-            expected_returns = factor_exposures.dot(recent_mean_factor_returns)
-            
-            # Step 3: Calculate covariance matrix Σ = BFB^T + D
-            B = factor_exposures.values  # Asset exposures matrix
-            n_assets = B.shape[0]
-            
-            # Factor covariance matrix F
-            F = np.cov(recent_factor_returns.T)
-            if F.ndim == 0:
-                F = np.array([[F]])
-            elif F.ndim == 1:
-                F = F.reshape(1, 1)
-            
-            # Systematic covariance: BFB^T
-            systematic_cov = B @ F @ B.T
-            
-            # Specific risk matrix D (diagonal)
-            D = np.diag(specific_risks)
-            
-            # Full covariance matrix: Σ = BFB^T + D + regularization
-            Sigma = systematic_cov + D
-            reg_param = max(1e-8, 0.001 * np.trace(Sigma) / n_assets)
-            Sigma += reg_param * np.eye(n_assets)
-            
-            # Step 4: Solve optimization (reuse existing pattern)
-            mu = expected_returns.values
-            
-            # Pre-align previous weights for turnover penalty (similar to MVO)
-            aligned_prev = np.zeros(n_assets)
-            if prev_weights is not None and not prev_weights.empty:
-                for i, symbol in enumerate(available_symbols):
-                    if symbol in prev_weights.index:
-                        aligned_prev[i] = prev_weights[symbol]
-            
-            # Try analytical solution first (when no turnover penalty)
-            if self.turnover_penalty == 0 or prev_weights is None or prev_weights.empty:
-                try:
-                    ones = np.ones(n_assets)
-                    inv_Sigma = np.linalg.inv(Sigma)
-                    A = ones.T @ inv_Sigma @ ones
-                    B_scalar = mu.T @ inv_Sigma @ ones
-                    
-                    if A > 1e-10:
-                        lambda_mult = B_scalar / A
-                        weights = (inv_Sigma @ mu - lambda_mult * inv_Sigma @ ones) / self.barra_risk_aversion
-                        
-                        # Apply constraints
-                        max_weight = min(0.1, 2.0 / n_assets)
-                        weights = np.clip(weights, -max_weight, max_weight)
-                        if np.sum(weights) != 0:
-                            weights = weights - np.sum(weights) / n_assets
-                        
-                        return pd.Series(weights, index=available_symbols)
-                        
-                except (np.linalg.LinAlgError, ValueError):
-                    pass  # Fall back to numerical optimization
-            
-            # Fallback to numerical optimization
-            def objective(w):
-                portfolio_return = np.dot(w, mu)
-                portfolio_variance = np.dot(w, np.dot(Sigma, w))
-                
-                # Mean-variance objective (negative because we minimize)
-                objective_value = -portfolio_return + 0.5 * self.barra_risk_aversion * portfolio_variance
-                
-                # Add turnover penalty (similar to MVO)
-                if self.turnover_penalty > 0:
-                    turnover = np.sum(np.abs(w - aligned_prev))
-                    objective_value += self.turnover_penalty * turnover
-                
-                return objective_value
-            
-            max_weight = min(0.1, 2.0 / n_assets)
-            bounds = [(-max_weight, max_weight)] * n_assets
-            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w)}]
-            
-            # Initial guess based on expected returns
-            x0 = np.zeros(n_assets)
-            if len(mu) > 0:
-                ranked = np.argsort(-mu)
-                n_long = max(1, n_assets // 4)
-                n_short = max(1, n_assets // 4)
-                x0[ranked[:n_long]] = 1.0 / n_long
-                x0[ranked[-n_short:]] = -1.0 / n_short
-            
-            result = minimize(objective, x0, method='SLSQP', bounds=bounds, 
-                            constraints=constraints, options={'maxiter': 500, 'ftol': 1e-6})
-            
-            if result.success:
-                return pd.Series(result.x, index=available_symbols)
-            else:
-                # Final fallback: simple long-short based on expected returns
-                weights = pd.Series(0.0, index=available_symbols)
-                ranked_returns = expected_returns.rank(ascending=False)
-                n_long = max(1, len(available_symbols) // 4)
-                n_short = max(1, len(available_symbols) // 4)
-                weights[ranked_returns <= n_long] = 1.0 / n_long
-                weights[ranked_returns > len(available_symbols) - n_short] = -1.0 / n_short
-                return weights
-                
-        except Exception as e:
-            warnings.warn(f"Error in Barra weight calculation: {str(e)}")
-            return None
-
-    def _equal_weight_daily_trade_list(self):
-        """
-        Equal-weight long/short portfolio built directly from the composite factor.
-
-        Rules per date:
-        1. Long all names with factor > 0, short all names with factor < 0.
-        2. Keep only the top ``pct`` fraction of candidates in each leg.
-        3. Allocate equal weight within each leg so that longs sum to +1 and shorts to ‑1.
-        4. If either leg is empty (no positive or no negative values) the strategy stays flat
-           that day (no positions, no carry-forward).
-        5. No previous-day portfolio is ever carried forward.
-        """
+        """Generate daily portfolio weights using the specified method."""
         weights_list, count_list = [], []
 
-        for date, group in tqdm(self.custom_feature.groupby(level="date"), desc="Equal Weight Simulation"):
-            x = group.droplevel('date')  # factor series already has fillna(0)
-
-            # Separate positive and negative signals; zeros are ignored.
+        for date, group in tqdm(self.custom_feature.groupby(level="date"), 
+                               desc=f"{self.method.title()} Weight Simulation"):
+            x = group.droplevel('date')
+            
+            # Separate positive and negative signals
             pos = x[x > 0]
             neg = x[x < 0]
 
-            # If one leg is missing, store explicit zero weights so that shift(1)
-            # keeps the timing alignment (we stay flat next day).
+            # If one leg is missing, stay flat
             if pos.empty or neg.empty:
                 zero_w = pd.Series(0.0, index=x.index)
                 zero_w.index = pd.MultiIndex.from_product(
-                    [[date], zero_w.index],
-                    names=["date", "symbol"]
+                    [[date], zero_w.index], names=["date", "symbol"]
                 )
                 weights_list.append(zero_w)
                 count_list.append({"date": date, "long_count": 0, "short_count": 0})
                 continue
 
-            # Select the strongest pct of each side
-            k_long = max(int(np.floor(len(pos) * self.pct)), 1)
-            k_short = max(int(np.floor(len(neg) * self.pct)), 1)
+            # For MVO methods, check if we have enough assets for optimization
+            if self.method in ['mvo', 'mvo_turnover'] and len(x) < 2:
+                zero_w = pd.Series(0.0, index=x.index)
+                zero_w.index = pd.MultiIndex.from_product(
+                    [[date], zero_w.index], names=["date", "symbol"]
+                )
+                weights_list.append(zero_w)
+                count_list.append({"date": date, "long_count": 0, "short_count": 0})
+                continue
 
-            top_pos = pos.sort_values(ascending=False).iloc[:k_long]
-            top_neg = neg.sort_values().iloc[:k_short]  # most negative values first
+            # Calculate weights based on method
+            if self.method == 'equal':
+                weights, long_count, short_count = self._calculate_equal_weights(pos, neg, x.index)
+            elif self.method == 'linear':
+                weights, long_count, short_count = self._calculate_linear_weights(pos, neg, x.index)
+            elif self.method == 'mvo':
+                weights, long_count, short_count = self._calculate_mvo_weights(x, pos, neg, date)
+            elif self.method == 'mvo_turnover':
+                # Get previous weights for turnover penalty
+                prev_weights = self._get_previous_weights(weights_list, x.index)
+                weights, long_count, short_count = self._calculate_mvo_turnover_weights(x, pos, neg, date, prev_weights)
+            else:
+                raise ValueError(f"Unknown method {self.method}")
 
-            # Allocate equal weights
-            weights = pd.Series(0.0, index=x.index)
-            weights[top_pos.index] = 1.0 / k_long
-            weights[top_neg.index] = -1.0 / k_short
-
-            long_count, short_count = k_long, k_short
-
-            # Stamp the date on the index
+            # Add date to index
             weights.index = pd.MultiIndex.from_product(
-                [[date], weights.index],
-                names=["date", "symbol"]
+                [[date], weights.index], names=["date", "symbol"]
             )
-
+            
             weights_list.append(weights)
-            count_list.append({"date": date,
-                               "long_count": long_count,
-                               "short_count": short_count})
+            count_list.append({"date": date, "long_count": long_count, "short_count": short_count})
 
-        all_w = pd.concat(weights_list).sort_index()
-        # Shift by 1 day so weights are implemented the next trading day
-        shifted = all_w.groupby("symbol").shift(1)
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        return shifted, counts_df
-
-    def _flexible_weight_daily_trade_list(self):
-        """
-        Flexible-weight portfolio:
-            • Long names with factor > 0; weight proportional to factor value.
-            • Short names with factor < 0; weight proportional to |factor value|.
-            • Execute only if *both* long and short sides have at least one asset.
-            • Long leg normalised to +1, short leg to –1 by _process_weights.
-            • No min-universe requirement, no carry-forward of old positions.
-        """
-        weights_list, count_list = [], []
-
-        for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="Flexible Weight Simulation"):
-            x = group.droplevel('date')  # zeros already present, we keep them
-
-            pos = x[x > 0]
-            neg = x[x < 0]
-
-            # If one leg is missing, store explicit zero weights so that shift(1)
-            # keeps timing alignment (flat exposure next day).
-            if pos.empty or neg.empty:
-                zero_w = pd.Series(0.0, index=x.index)
-                zero_w.index = pd.MultiIndex.from_product(
-                    [[date], zero_w.index],
-                    names=["date", "symbol"]
-                )
-                weights_list.append(zero_w)
-                count_list.append({"date": date, "long_count": 0, "short_count": 0})
-                continue
-
-            # Raw weights proportional to factor
-            w = pd.Series(0.0, index=x.index)
-            w[pos.index] = pos
-            w[neg.index] = neg
-
-            long_count = len(pos)
-            short_count = len(neg)
-
-            # Normalise & cap
-            w = self._process_weights(w)
-
-            # Attach date level
-            w.index = pd.MultiIndex.from_product(
-                [[date], w.index],
-                names=["date", "symbol"]
-            )
-
-            weights_list.append(w)
-            count_list.append({"date": date,
-                               "long_count": long_count,
-                               "short_count": short_count})
-
+        # Common post-processing
         all_w = pd.concat(weights_list).sort_index()
         shifted = all_w.groupby("symbol").shift(1)
         counts_df = pd.DataFrame(count_list).set_index("date")
         return shifted, counts_df
 
-    def _pca_mvo_daily_trade_list(self):
-        """
-        PCA-based Mean-Variance Optimization combined with composite factor weighting.
+    def _calculate_equal_weights(self, pos, neg, symbols):
+        """Calculate equal weights for positive and negative signals."""
+        k_long = max(int(np.floor(len(pos) * self.pct)), 1)
+        k_short = max(int(np.floor(len(neg) * self.pct)), 1)
+
+        top_pos = pos.sort_values(ascending=False).iloc[:k_long]
+        top_neg = neg.sort_values().iloc[:k_short]
+
+        weights = pd.Series(0.0, index=symbols)
+        weights[top_pos.index] = 1.0
+        weights[top_neg.index] = -1.0
+
+        weights = self._normalize_legs(weights)
         
-        Process:
-        1. Calculate composite factor weights for each date
-        2. Apply PCA-based mean-variance optimization on historical returns 
-        3. Combine both weights using tunable parameter
-        4. Process and return final weights
-        """
-        weights_list = []
-        count_list = []
-        prev_weights = pd.Series(dtype=float)
-        prev_counts = {"long_count": np.nan, "short_count": np.nan}
+        return weights, k_long, k_short
 
-        for date, group in tqdm(self.custom_feature.groupby(level='date'), desc="PCA-MVO Weight Simulation"):
-            x = group.droplevel('date').dropna()
-            if len(x) < self.min_universe:
-                # carry previous if too small
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-                continue
+    def _calculate_linear_weights(self, pos, neg, symbols):
+        """Calculate linear weights proportional to factor values."""
+        weights = pd.Series(0.0, index=symbols)
+        weights[pos.index] = pos
+        weights[neg.index] = neg
 
-            try:
-                # Get historical returns for PCA-MVO
-                returns_data = self._get_historical_returns(date, x.index)
-                
-                # Baseline: flexible-weight portfolio for the current date
-                flex_weights_raw = self._get_flexible_weights(x)
+        weights = self._normalize_legs(weights)
+        weights = self._cap_and_redistribute(weights, self.max_weight)
+        
+        return weights, len(pos), len(neg)
 
-                if returns_data is None or returns_data.empty:
-                    # Not enough data ⇒ use flexible weights
-                    combined_weights = flex_weights_raw
-                else:
-                    # Calculate PCA-MVO weights
-                    pca_mvo_weights = self._calculate_pca_mvo_weights(returns_data, prev_weights)
-                    
-                    # If PCA-MVO weights unavailable or near-zero, fall back to flexible weights
-                    if pca_mvo_weights is None or pca_mvo_weights.abs().sum() < 1e-12:
-                        combined_weights = flex_weights_raw
-                    else:
-                        # Blend flexible and PCA-MVO weights
-                        combined_weights = self._combine_weights(flex_weights_raw, pca_mvo_weights, x.index)
-                
-                # Process weights (normalize and apply constraints)
-                weights = self._process_weights(combined_weights)
-                
-                # Count positions
-                long_count = int((weights > 0).sum())
-                short_count = int((weights < 0).sum())
-                
-                prev_weights = weights
-                prev_counts = {"long_count": long_count, "short_count": short_count}
+    def _calculate_mvo_weights(self, composite_factor, pos, neg, current_date):
+        """Calculate mean variance optimization weights with fast optimizer."""
+        # Get covariance matrix
+        cov_matrix = self._calculate_covariance_matrix(composite_factor.index, current_date)
+        
+        if cov_matrix is None or cov_matrix.shape[0] < 2:
+            # Fallback to equal weights if covariance calculation fails
+            return self._calculate_equal_weights(pos, neg, composite_factor.index)
+        
+        # Apply shrinkage to improve conditioning
+        cov_matrix = self._apply_shrinkage(cov_matrix)
+        
+        # Use factor values as expected returns
+        expected_returns = composite_factor
+        
+        # Perform mean variance optimization with fast CVXPY solver
+        if self.use_cvxpy:
+            optimal_weights = self._solve_mvo_cvxpy(expected_returns, cov_matrix, pos, neg)
+        else:
+            optimal_weights = self._solve_mvo(expected_returns, cov_matrix)
+        
+        return optimal_weights, len(pos), len(neg)
 
-                # annotate date level
-                weights.index = pd.MultiIndex.from_product(
-                    [[date], weights.index],
-                    names=["date", "symbol"]
-                )
-                weights_list.append(weights)
-                count_list.append({"date": date,
-                                   "long_count": long_count,
-                                   "short_count": short_count})
-                                   
-            except Exception as e:
-                warnings.warn(f"PCA-MVO optimization failed for date {date}: {str(e)}. Using previous weights.")
-                if not prev_weights.empty:
-                    carried = prev_weights.copy()
-                    carried.index = pd.MultiIndex.from_product(
-                        [[date], carried.index],
-                        names=["date", "symbol"]
-                    )
-                    weights_list.append(carried)
-                    count_list.append({"date": date, **prev_counts})
-
+    def _get_previous_weights(self, weights_list, current_symbols):
+        """Get previous day's weights for the current symbols, defaulting to zero if not available."""
         if not weights_list:
-            # Return empty results if no weights were generated
-            empty_weights = pd.Series(dtype=float)
-            empty_counts = pd.DataFrame(columns=["long_count", "short_count"])
-            return empty_weights, empty_counts
+            # First day: no previous weights
+            return pd.Series(0.0, index=current_symbols)
+        
+        # Get the most recent weights (last element in weights_list)
+        prev_weights_with_date = weights_list[-1]
+        
+        # Remove date level to get just symbol weights
+        prev_weights = prev_weights_with_date.droplevel('date')
+        
+        # Align with current symbols, filling missing symbols with 0
+        aligned_weights = pd.Series(0.0, index=current_symbols)
+        
+        # Update with previous weights where available
+        common_symbols = prev_weights.index.intersection(current_symbols)
+        aligned_weights.loc[common_symbols] = prev_weights.loc[common_symbols]
+        
+        return aligned_weights
 
-        all_w = pd.concat(weights_list).sort_index()
-        shifted = all_w.groupby("symbol").shift(1)
-        counts_df = pd.DataFrame(count_list).set_index("date")
-        return shifted, counts_df
+    def _calculate_mvo_turnover_weights(self, composite_factor, pos, neg, current_date, prev_weights):
+        """Calculate mean variance optimization weights with turnover penalty."""
+        # Get covariance matrix (same as regular MVO)
+        cov_matrix = self._calculate_covariance_matrix(composite_factor.index, current_date)
+        
+        if cov_matrix is None or cov_matrix.shape[0] < 2:
+            # Fallback to equal weights if covariance calculation fails
+            return self._calculate_equal_weights(pos, neg, composite_factor.index)
+        
+        # Apply shrinkage to improve conditioning (same as regular MVO)
+        cov_matrix = self._apply_shrinkage(cov_matrix)
+        
+        # Use factor values as expected returns (same as regular MVO)
+        expected_returns = composite_factor
+        
+        # Perform mean variance optimization with turnover penalty
+        if self.use_cvxpy:
+            optimal_weights = self._solve_mvo_turnover_cvxpy(expected_returns, cov_matrix, pos, neg, prev_weights)
+        else:
+            optimal_weights = self._solve_mvo_turnover(expected_returns, cov_matrix, prev_weights)
+        
+        return optimal_weights, len(pos), len(neg)
 
-    def _process_weights(self, weights: pd.Series, max_weight: float = None) -> pd.Series:
-        """
-        Consistent weight processing across all methods.
-        
-        Process order:
-        1. Normalize weights for market neutrality (long leg = 1, short leg = -1)
-        2. Apply max weight constraints and redistribute
-        
-        Args:
-            weights: pd.Series of raw weights
-            max_weight: maximum absolute weight (uses self.max_weight if None)
-            
-        Returns:
-            pd.Series of processed weights
-        """
-        if max_weight is None:
-            max_weight = self.max_weight
-            
-        w = weights.copy()
-        
-        # Step 1: Normalize for market neutrality
-        w = self._normalize_weights(w)
-        
-        # Step 2: Apply max weight constraints and redistribute
-        w = self._cap_and_redistribute(w, max_weight)
-        
-        return w
-    
-    def _normalize_weights(self, weights):
-        """
-        Normalize weights to ensure market neutrality.
-        Long and short legs are normalized separately.
-        """
-        w = weights.copy()
-        
-        # Separate long and short positions
-        w_pos = w.clip(lower=0)
-        w_neg = w.clip(upper=0)
-        
-        # Normalize long leg to sum to 1
+    @staticmethod
+    def _normalize_legs(weights: pd.Series) -> pd.Series:
+        """Normalize long and short legs to sum to 1 and -1 respectively."""
+        w_pos = weights.clip(lower=0)
+        w_neg = weights.clip(upper=0)
+
         if w_pos.sum() > 0:
             w_pos /= w_pos.sum()
         
-        # Normalize short leg to sum to -1
         if w_neg.sum() < 0:
             w_neg /= -w_neg.sum()
-        
-        # Combine
-        w_normalized = w_pos + w_neg
-        
-        return w_normalized
-    
+            
+        return w_pos + w_neg
+
     @staticmethod
     def _cap_and_redistribute(weights: pd.Series, max_weight: float,
                               max_iter: int = 10, tol: float = 1e-6) -> pd.Series:
@@ -1251,6 +309,411 @@ class Simulation:
         
         # Final clip to ensure constraints are satisfied
         return w.clip(lower=-max_weight, upper=max_weight)
+
+    def _calculate_covariance_matrix(self, symbols, current_date):
+        """Calculate covariance matrix from historical returns that matches the symbols index exactly."""
+        try:
+            # Get historical returns for the symbols
+            hist_returns = self.returns.loc[self.returns.index.get_level_values('symbol').isin(symbols)]
+            
+            # Filter to dates before current_date
+            hist_returns = hist_returns.loc[hist_returns.index.get_level_values('date') < current_date]
+            
+            if len(hist_returns) == 0:
+                return None
+            
+            # Get the last lookback_period days
+            dates = hist_returns.index.get_level_values('date').unique().sort_values()
+            if len(dates) < self.lookback_period:
+                start_date = dates[0]
+            else:
+                start_date = dates[-self.lookback_period]
+            
+            hist_returns = hist_returns.loc[hist_returns.index.get_level_values('date') >= start_date]
+            
+            # Pivot to get returns matrix (dates x symbols)
+            returns_matrix = hist_returns.unstack('symbol').fillna(0)
+            
+            # Ensure we include ALL symbols from the composite factor index
+            # If a symbol is missing from returns data, fill with zeros
+            missing_symbols = [s for s in symbols if s not in returns_matrix.columns]
+            for symbol in missing_symbols:
+                returns_matrix[symbol] = 0.0
+            
+            # Reorder columns to match the original symbols order
+            returns_matrix = returns_matrix[list(symbols)]
+            
+            # Calculate covariance matrix
+            cov_matrix = returns_matrix.cov()
+            
+            # Add small regularization to diagonal for numerical stability
+            regularization = 1e-6
+            np.fill_diagonal(cov_matrix.values, cov_matrix.values.diagonal() + regularization)
+            
+            return cov_matrix
+            
+        except Exception as e:
+            warnings.warn(f"Covariance calculation failed: {e}")
+            return None
+
+    def _apply_shrinkage(self, cov_matrix):
+        """Apply shrinkage to covariance matrix for better conditioning."""
+        if self.shrinkage_intensity <= 0:
+            return cov_matrix
+        
+        # Identity matrix scaled by average diagonal
+        avg_var = np.mean(np.diag(cov_matrix.values))
+        identity = np.eye(cov_matrix.shape[0]) * avg_var
+        
+        # Shrink towards identity matrix
+        shrunk_cov = (1 - self.shrinkage_intensity) * cov_matrix.values + \
+                     self.shrinkage_intensity * identity
+        
+        return pd.DataFrame(shrunk_cov, index=cov_matrix.index, columns=cov_matrix.columns)
+
+    def _solve_mvo_cvxpy(self, expected_returns, cov_matrix, pos, neg):
+        """
+        Fast CVXPY-based mean variance optimization solver.
+        Follows the same logic as _solve_mvo but uses CVXPY for faster optimization.
+        """
+        n = len(expected_returns)
+        
+        # Separate into positive and negative expected returns (same as original)
+        pos_mask = expected_returns > 0
+        neg_mask = expected_returns < 0
+        
+        # Initial guess: equal weights for long/short legs (same as original)
+        x0 = np.zeros(n)
+        x0[pos_mask] = 1.0 / pos_mask.sum()
+        x0[neg_mask] = -1.0 / neg_mask.sum()
+        
+        # Create optimization variable
+        w = cp.Variable(n)
+        
+        # Objective: minimize portfolio variance (same as original objective)
+        # Make sure covariance matrix is positive semidefinite
+        cov_np = cov_matrix.values
+        cov_np = 0.5 * (cov_np + cov_np.T)  # Ensure symmetry
+        objective = cp.Minimize(cp.quad_form(w, cov_np))
+        
+        # Constraints (exactly same as original)
+        constraints = [
+            # Long leg (positive signals) sums to +1
+            cp.sum(w[pos_mask.values]) == 1.0,
+            # Short leg (negative signals) sums to -1
+            cp.sum(w[neg_mask.values]) == -1.0
+        ]
+        
+        # Bounds: respect sign constraints and max weight limits (same as original)
+        for i in range(n):
+            if pos_mask.iloc[i]:
+                # Positive signals: weight between 0 and max_weight
+                constraints.append(w[i] >= 0)
+                constraints.append(w[i] <= self.max_weight)
+            elif neg_mask.iloc[i]:
+                # Negative signals: weight between -max_weight and 0
+                constraints.append(w[i] <= 0)
+                constraints.append(w[i] >= -self.max_weight)
+            else:
+                # Zero signals: weight must be 0
+                constraints.append(w[i] == 0)
+        
+        # Create and solve problem
+        prob = cp.Problem(objective, constraints)
+        
+        try:
+            # Use fast OSQP solver with relaxed settings for speed
+            prob.solve(
+                solver=getattr(cp, self.mvo_solver),
+                verbose=False,
+                eps_abs=1e-4,  # Relaxed absolute tolerance
+                eps_rel=1e-4,  # Relaxed relative tolerance
+                max_iter=2000,  # Limit iterations
+                adaptive_rho=True,  # Adaptive penalty parameter
+                polish=True,  # Polish solution
+                warm_start=True  # Warm start
+            )
+            
+            if prob.status == cp.OPTIMAL:
+                optimal_weights = pd.Series(w.value, index=expected_returns.index)
+                
+                # Verify constraints are satisfied (same as original)
+                long_sum = optimal_weights[pos_mask].sum()
+                short_sum = optimal_weights[neg_mask].sum()
+                total_sum = optimal_weights.sum()
+                
+                # Small tolerance for numerical precision
+                if abs(long_sum - 1.0) > 1e-6 or abs(short_sum + 1.0) > 1e-6:
+                    warnings.warn(f"CVXPY MVO constraints not satisfied: long_sum={long_sum:.6f}, short_sum={short_sum:.6f}, total_sum={total_sum:.6f}")
+                
+            else:
+                # Fallback to initial guess if optimization fails (same as original)
+                optimal_weights = pd.Series(x0, index=expected_returns.index)
+                warnings.warn(f"CVXPY optimization failed with status: {prob.status}")
+                
+        except Exception as e:
+            warnings.warn(f"CVXPY optimization failed: {e}")
+            # Fallback to initial guess (same as original)
+            optimal_weights = pd.Series(x0, index=expected_returns.index)
+        
+        return optimal_weights
+
+    def _solve_mvo_turnover_cvxpy(self, expected_returns, cov_matrix, pos, neg, prev_weights):
+        """
+        Fast CVXPY-based mean variance optimization solver with turnover penalty.
+        Follows the same logic as _solve_mvo_cvxpy but adds turnover penalty to the objective.
+        
+        Objective: minimize portfolio_variance + turnover_penalty * turnover
+        where turnover = sum(|w_i - prev_w_i|)
+        """
+        n = len(expected_returns)
+        
+        # Separate into positive and negative expected returns (same as original)
+        pos_mask = expected_returns > 0
+        neg_mask = expected_returns < 0
+        
+        # Initial guess: equal weights for long/short legs (same as original)
+        x0 = np.zeros(n)
+        x0[pos_mask] = 1.0 / pos_mask.sum()
+        x0[neg_mask] = -1.0 / neg_mask.sum()
+        
+        # Create optimization variable
+        w = cp.Variable(n)
+        
+        # Objective: minimize portfolio variance + turnover penalty
+        # Make sure covariance matrix is positive semidefinite
+        cov_np = cov_matrix.values
+        cov_np = 0.5 * (cov_np + cov_np.T)  # Ensure symmetry
+        
+        # Portfolio variance term (same as original)
+        variance_term = cp.quad_form(w, cov_np)
+        
+        # Turnover penalty term: sum of absolute differences from previous weights
+        prev_weights_np = prev_weights.values
+        turnover_term = cp.sum(cp.abs(w - prev_weights_np))
+        
+        # Combined objective
+        objective = cp.Minimize(variance_term + self.turnover_penalty * turnover_term)
+        
+        # Constraints (exactly same as original)
+        constraints = [
+            # Long leg (positive signals) sums to +1
+            cp.sum(w[pos_mask.values]) == 1.0,
+            # Short leg (negative signals) sums to -1
+            cp.sum(w[neg_mask.values]) == -1.0
+        ]
+        
+        # Bounds: respect sign constraints and max weight limits (same as original)
+        for i in range(n):
+            if pos_mask.iloc[i]:
+                # Positive signals: weight between 0 and max_weight
+                constraints.append(w[i] >= 0)
+                constraints.append(w[i] <= self.max_weight)
+            elif neg_mask.iloc[i]:
+                # Negative signals: weight between -max_weight and 0
+                constraints.append(w[i] <= 0)
+                constraints.append(w[i] >= -self.max_weight)
+            else:
+                # Zero signals: weight must be 0
+                constraints.append(w[i] == 0)
+        
+        # Create and solve problem
+        prob = cp.Problem(objective, constraints)
+        
+        try:
+            # Use fast OSQP solver with relaxed settings for speed
+            prob.solve(
+                solver=getattr(cp, self.mvo_solver),
+                verbose=False,
+                eps_abs=1e-4,  # Relaxed absolute tolerance
+                eps_rel=1e-4,  # Relaxed relative tolerance
+                max_iter=2000,  # Limit iterations
+                adaptive_rho=True,  # Adaptive penalty parameter
+                polish=True,  # Polish solution
+                warm_start=True  # Warm start
+            )
+            
+            if prob.status == cp.OPTIMAL:
+                optimal_weights = pd.Series(w.value, index=expected_returns.index)
+                
+                # Verify constraints are satisfied (same as original)
+                long_sum = optimal_weights[pos_mask].sum()
+                short_sum = optimal_weights[neg_mask].sum()
+                total_sum = optimal_weights.sum()
+                
+                # Small tolerance for numerical precision
+                if abs(long_sum - 1.0) > 1e-6 or abs(short_sum + 1.0) > 1e-6:
+                    warnings.warn(f"CVXPY MVO+Turnover constraints not satisfied: long_sum={long_sum:.6f}, short_sum={short_sum:.6f}, total_sum={total_sum:.6f}")
+                
+            else:
+                # Fallback to initial guess if optimization fails (same as original)
+                optimal_weights = pd.Series(x0, index=expected_returns.index)
+                warnings.warn(f"CVXPY MVO+Turnover optimization failed with status: {prob.status}")
+                
+        except Exception as e:
+            warnings.warn(f"CVXPY MVO+Turnover optimization failed: {e}")
+            # Fallback to initial guess (same as original)
+            optimal_weights = pd.Series(x0, index=expected_returns.index)
+        
+        return optimal_weights
+
+    def _solve_mvo(self, expected_returns, cov_matrix):
+        """
+        Solve mean variance optimization problem with proper constraints:
+        - Long leg sums to +1
+        - Short leg sums to -1  
+        - Total portfolio weight sums to 0 (market neutral)
+        - Individual weights respect max_weight bounds
+        """
+        n = len(expected_returns)
+        
+        # Separate into positive and negative expected returns
+        pos_mask = expected_returns > 0
+        neg_mask = expected_returns < 0
+        
+        # Objective function: minimize portfolio variance
+        def objective(weights):
+            return np.dot(weights, np.dot(cov_matrix.values, weights))
+        
+        # Initial guess: equal weights for long/short legs
+        x0 = np.zeros(n)
+        x0[pos_mask] = 1.0 / pos_mask.sum()
+        x0[neg_mask] = -1.0 / neg_mask.sum()
+        
+        # Constraints
+        constraints = [
+            # Long leg (positive signals) sums to +1
+            {'type': 'eq', 'fun': lambda w: w[pos_mask].sum() - 1.0},
+            # Short leg (negative signals) sums to -1
+            {'type': 'eq', 'fun': lambda w: w[neg_mask].sum() + 1.0}
+        ]
+        
+        # Bounds: respect sign constraints and max weight limits
+        bounds = []
+        for i in range(n):
+            if pos_mask.iloc[i]:
+                # Positive signals: weight between 0 and max_weight
+                bounds.append((0, self.max_weight))
+            elif neg_mask.iloc[i]:
+                # Negative signals: weight between -max_weight and 0
+                bounds.append((-self.max_weight, 0))
+            else:
+                # Zero signals: weight must be 0
+                bounds.append((0, 0))
+        
+        try:
+            # Solve optimization
+            result = minimize(
+                objective, x0, method='SLSQP',
+                bounds=bounds, constraints=constraints,
+                options={'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            if result.success:
+                optimal_weights = pd.Series(result.x, index=expected_returns.index)
+                
+                # Verify constraints are satisfied (for debugging)
+                long_sum = optimal_weights[pos_mask].sum()
+                short_sum = optimal_weights[neg_mask].sum()
+                total_sum = optimal_weights.sum()
+                
+                # Small tolerance for numerical precision
+                if abs(long_sum - 1.0) > 1e-6 or abs(short_sum + 1.0) > 1e-6:
+                    warnings.warn(f"MVO constraints not satisfied: long_sum={long_sum:.6f}, short_sum={short_sum:.6f}, total_sum={total_sum:.6f}")
+                
+            else:
+                # Fallback to initial guess if optimization fails
+                optimal_weights = pd.Series(x0, index=expected_returns.index)
+                warnings.warn(f"MVO optimization failed: {result.message}")
+                
+        except Exception as e:
+            warnings.warn(f"MVO optimization failed: {e}")
+            # Fallback to initial guess
+            optimal_weights = pd.Series(x0, index=expected_returns.index)
+        
+        return optimal_weights
+
+    def _solve_mvo_turnover(self, expected_returns, cov_matrix, prev_weights):
+        """
+        Solve mean variance optimization problem with turnover penalty using scipy.
+        Follows the same logic as _solve_mvo but adds turnover penalty to the objective.
+        
+        Objective: minimize portfolio_variance + turnover_penalty * turnover
+        where turnover = sum(|w_i - prev_w_i|)
+        """
+        n = len(expected_returns)
+        
+        # Separate into positive and negative expected returns
+        pos_mask = expected_returns > 0
+        neg_mask = expected_returns < 0
+        
+        # Objective function: minimize portfolio variance + turnover penalty
+        def objective(weights):
+            # Portfolio variance term
+            variance_term = np.dot(weights, np.dot(cov_matrix.values, weights))
+            
+            # Turnover penalty term: sum of absolute differences from previous weights
+            turnover_term = np.sum(np.abs(weights - prev_weights.values))
+            
+            return variance_term + self.turnover_penalty * turnover_term
+        
+        # Initial guess: equal weights for long/short legs (same as original)
+        x0 = np.zeros(n)
+        x0[pos_mask] = 1.0 / pos_mask.sum()
+        x0[neg_mask] = -1.0 / neg_mask.sum()
+        
+        # Constraints (exactly same as original)
+        constraints = [
+            # Long leg (positive signals) sums to +1
+            {'type': 'eq', 'fun': lambda w: w[pos_mask].sum() - 1.0},
+            # Short leg (negative signals) sums to -1
+            {'type': 'eq', 'fun': lambda w: w[neg_mask].sum() + 1.0}
+        ]
+        
+        # Bounds: respect sign constraints and max weight limits (same as original)
+        bounds = []
+        for i in range(n):
+            if pos_mask.iloc[i]:
+                # Positive signals: weight between 0 and max_weight
+                bounds.append((0, self.max_weight))
+            elif neg_mask.iloc[i]:
+                # Negative signals: weight between -max_weight and 0
+                bounds.append((-self.max_weight, 0))
+            else:
+                # Zero signals: weight must be 0
+                bounds.append((0, 0))
+        
+        try:
+            # Solve optimization
+            result = minimize(
+                objective, x0, method='SLSQP',
+                bounds=bounds, constraints=constraints,
+                options={'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            if result.success:
+                optimal_weights = pd.Series(result.x, index=expected_returns.index)
+                
+                # Verify constraints are satisfied (for debugging)
+                long_sum = optimal_weights[pos_mask].sum()
+                short_sum = optimal_weights[neg_mask].sum()
+                total_sum = optimal_weights.sum()
+                
+                # Small tolerance for numerical precision
+                if abs(long_sum - 1.0) > 1e-6 or abs(short_sum + 1.0) > 1e-6:
+                    warnings.warn(f"MVO+Turnover constraints not satisfied: long_sum={long_sum:.6f}, short_sum={short_sum:.6f}, total_sum={total_sum:.6f}")
+                
+            else:
+                # Fallback to initial guess if optimization fails
+                optimal_weights = pd.Series(x0, index=expected_returns.index)
+                warnings.warn(f"MVO+Turnover optimization failed: {result.message}")
+                
+        except Exception as e:
+            warnings.warn(f"MVO+Turnover optimization failed: {e}")
+            # Fallback to initial guess
+            optimal_weights = pd.Series(x0, index=expected_returns.index)
+        
+        return optimal_weights
 
     def _daily_portfolio_returns(self, weights: pd.Series):
         # align
