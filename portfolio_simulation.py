@@ -30,6 +30,7 @@ class SimulationSettings:
     mvo_solver: str = 'OSQP'       # CVXPY solver: 'OSQP' (fastest), 'ECOS', 'SCS'
     shrinkage_intensity: float = 0.1  # shrinkage intensity for covariance regularization
     turnover_penalty: float = 0.1     # penalty weight for turnover in MVO with turnover optimization
+    return_weight: float = 0.0         # weight for expected return reward in MVO with turnover optimization
 
 class Simulation:
     """
@@ -65,6 +66,7 @@ class Simulation:
         self.mvo_solver         = s.mvo_solver
         self.shrinkage_intensity = s.shrinkage_intensity
         self.turnover_penalty = s.turnover_penalty
+        self.return_weight = s.return_weight
 
     def run(self):
         self.factors_df[self.name] = self.custom_feature
@@ -434,7 +436,7 @@ class Simulation:
                 warm_start=True  # Warm start
             )
             
-            if prob.status == cp.OPTIMAL:
+            if prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and w.value is not None:
                 optimal_weights = pd.Series(w.value, index=expected_returns.index)
                 
                 # Verify constraints are satisfied (same as original)
@@ -449,7 +451,7 @@ class Simulation:
             else:
                 # Fallback to initial guess if optimization fails (same as original)
                 optimal_weights = pd.Series(x0, index=expected_returns.index)
-                warnings.warn(f"CVXPY optimization failed with status: {prob.status}")
+                warnings.warn(f"CVXPY optimization failed or inaccurate without solution; status: {prob.status}")
                 
         except Exception as e:
             warnings.warn(f"CVXPY optimization failed: {e}")
@@ -460,10 +462,10 @@ class Simulation:
 
     def _solve_mvo_turnover_cvxpy(self, expected_returns, cov_matrix, pos, neg, prev_weights):
         """
-        Fast CVXPY-based mean variance optimization solver with turnover penalty.
-        Follows the same logic as _solve_mvo_cvxpy but adds turnover penalty to the objective.
+        Fast CVXPY-based mean variance optimization solver with turnover penalty and expected return reward.
+        Follows the same logic as _solve_mvo_cvxpy but adds turnover penalty and expected return to the objective.
         
-        Objective: minimize portfolio_variance + turnover_penalty * turnover
+        Objective: minimize portfolio_variance + turnover_penalty * turnover - return_weight * expected_return
         where turnover = sum(|w_i - prev_w_i|)
         """
         n = len(expected_returns)
@@ -492,8 +494,11 @@ class Simulation:
         prev_weights_np = prev_weights.values
         turnover_term = cp.sum(cp.abs(w - prev_weights_np))
         
+        # Expected return reward term: dot(expected_returns, w)
+        expected_return_term = cp.sum(cp.multiply(expected_returns.values, w))
+        
         # Combined objective
-        objective = cp.Minimize(variance_term + self.turnover_penalty * turnover_term)
+        objective = cp.Minimize(variance_term + self.turnover_penalty * turnover_term - self.return_weight * expected_return_term)
         
         # Constraints (exactly same as original)
         constraints = [
@@ -527,13 +532,13 @@ class Simulation:
                 verbose=False,
                 eps_abs=1e-4,  # Relaxed absolute tolerance
                 eps_rel=1e-4,  # Relaxed relative tolerance
-                max_iter=2000,  # Limit iterations
+                max_iter=100,  # Limit iterations
                 adaptive_rho=True,  # Adaptive penalty parameter
                 polish=True,  # Polish solution
                 warm_start=True  # Warm start
             )
             
-            if prob.status == cp.OPTIMAL:
+            if prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and w.value is not None:
                 optimal_weights = pd.Series(w.value, index=expected_returns.index)
                 
                 # Verify constraints are satisfied (same as original)
@@ -545,10 +550,32 @@ class Simulation:
                 if abs(long_sum - 1.0) > 1e-6 or abs(short_sum + 1.0) > 1e-6:
                     warnings.warn(f"CVXPY MVO+Turnover constraints not satisfied: long_sum={long_sum:.6f}, short_sum={short_sum:.6f}, total_sum={total_sum:.6f}")
                 
+                # Post-solve pruning and renormalization for tiny weights
+                prune_eps = 1e-6
+                long_leg = optimal_weights[pos_mask].copy()
+                short_leg = optimal_weights[neg_mask].copy()
+                
+                # Zero-out tiny magnitudes
+                long_leg = long_leg.mask(long_leg.abs() < prune_eps, 0.0)
+                short_leg = short_leg.mask(short_leg.abs() < prune_eps, 0.0)
+                
+                # Renormalize each leg if possible
+                long_den = long_leg.sum()
+                short_den = -short_leg.sum()
+                
+                if long_den > 0 and short_den > 0:
+                     long_leg = long_leg / long_den
+                     short_leg = short_leg / short_den
+                     # Recombine
+                     pruned = pd.Series(0.0, index=optimal_weights.index)
+                     pruned.loc[pos_mask] = long_leg
+                     pruned.loc[neg_mask] = short_leg
+                     optimal_weights = pruned
+                
             else:
                 # Fallback to initial guess if optimization fails (same as original)
                 optimal_weights = pd.Series(x0, index=expected_returns.index)
-                warnings.warn(f"CVXPY MVO+Turnover optimization failed with status: {prob.status}")
+                warnings.warn(f"CVXPY MVO+Turnover optimization failed or inaccurate without solution; status: {prob.status}")
                 
         except Exception as e:
             warnings.warn(f"CVXPY MVO+Turnover optimization failed: {e}")
@@ -635,10 +662,10 @@ class Simulation:
 
     def _solve_mvo_turnover(self, expected_returns, cov_matrix, prev_weights):
         """
-        Solve mean variance optimization problem with turnover penalty using scipy.
-        Follows the same logic as _solve_mvo but adds turnover penalty to the objective.
+        Solve mean variance optimization problem with turnover penalty and expected return reward using scipy.
+        Follows the same logic as _solve_mvo but adds turnover penalty and expected return to the objective.
         
-        Objective: minimize portfolio_variance + turnover_penalty * turnover
+        Objective: minimize portfolio_variance + turnover_penalty * turnover - return_weight * expected_return
         where turnover = sum(|w_i - prev_w_i|)
         """
         n = len(expected_returns)
@@ -647,7 +674,7 @@ class Simulation:
         pos_mask = expected_returns > 0
         neg_mask = expected_returns < 0
         
-        # Objective function: minimize portfolio variance + turnover penalty
+        # Objective function: minimize portfolio variance + turnover penalty - expected return reward
         def objective(weights):
             # Portfolio variance term
             variance_term = np.dot(weights, np.dot(cov_matrix.values, weights))
@@ -655,7 +682,10 @@ class Simulation:
             # Turnover penalty term: sum of absolute differences from previous weights
             turnover_term = np.sum(np.abs(weights - prev_weights.values))
             
-            return variance_term + self.turnover_penalty * turnover_term
+            # Expected return reward term
+            expected_return_term = np.dot(expected_returns.values, weights)
+            
+            return variance_term + self.turnover_penalty * turnover_term - self.return_weight * expected_return_term
         
         # Initial guess: equal weights for long/short legs (same as original)
         x0 = np.zeros(n)
